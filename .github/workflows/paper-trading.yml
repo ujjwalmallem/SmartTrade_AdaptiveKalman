@@ -5,6 +5,9 @@ on:
     branches: [main, "cursor/**"]
   pull_request:
     branches: [main]
+  schedule:
+    # 6 times per day (every 4 hours, UTC)
+    - cron: "0 0,4,8,12,16,20 * * *"
 
 jobs:
   run-paper-trading:
