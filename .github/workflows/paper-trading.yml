@@ -34,3 +34,17 @@ jobs:
 
       - name: Run paper trading + ML exit trainer
         run: python paper_trading_ml_exit.py
+
+      - name: Retrain from stored results
+        run: python paper_trading_ml_exit.py --train-only
+
+      - name: Upload results artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: paper-trading-results
+          path: |
+            results/paper_trades.csv
+            results/exit_training_dataset.csv
+            results/logistic_exit_model.json
+          if-no-files-found: warn

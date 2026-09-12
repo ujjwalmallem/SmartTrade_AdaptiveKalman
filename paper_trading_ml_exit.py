@@ -3,13 +3,28 @@ Paper Trading + ML Exit Model Trainer
 Ready for Cursor AI
 """
 
+from __future__ import annotations
+
 import itertools
+import json
+from pathlib import Path
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Iterable, Optional, Sequence, Tuple
 import warnings
 warnings.filterwarnings("ignore")
+
+# Default artifact locations (gitignored locally; CI uploads as artifacts)
+RESULTS_DIR = Path("results")
+TRADES_CSV = RESULTS_DIR / "paper_trades.csv"
+DATASET_CSV = RESULTS_DIR / "exit_training_dataset.csv"
+MODEL_JSON = RESULTS_DIR / "logistic_exit_model.json"
+
+FEATURE_NAMES = [
+    "entry_z", "abs_entry_z", "pnl_proxy", "bars_held", "confidence",
+    "velocity", "exit_z", "favorable", "best_fav", "vol",
+]
 
 # ============================================================
 # PASTE ALL PREVIOUS CLASSES HERE (or keep them in the same file)
@@ -271,6 +286,7 @@ class LogisticExitModel:
     def __init__(self):
         self.weights = None
         self.bias = 0.0
+        self.feature_names: List[str] = list(FEATURE_NAMES)
 
     def _sigmoid(self, z):
         return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
@@ -293,6 +309,26 @@ class LogisticExitModel:
         X = np.asarray(X, dtype=float)
         return self._sigmoid(X @ self.weights + self.bias)
 
+    def save(self, path: Path = MODEL_JSON) -> Path:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "weights": self.weights.tolist() if self.weights is not None else None,
+            "bias": float(self.bias),
+            "feature_names": self.feature_names,
+        }
+        path.write_text(json.dumps(payload, indent=2))
+        return path
+
+    @classmethod
+    def load(cls, path: Path = MODEL_JSON) -> "LogisticExitModel":
+        payload = json.loads(Path(path).read_text())
+        model = cls()
+        model.weights = np.array(payload["weights"], dtype=float) if payload["weights"] else None
+        model.bias = float(payload["bias"])
+        model.feature_names = list(payload.get("feature_names", FEATURE_NAMES))
+        return model
+
 
 def analyze_feature_importance(model, feature_names):
     print("\nFeature importance (|weight|):")
@@ -301,6 +337,134 @@ def analyze_feature_importance(model, feature_names):
     for i in order:
         name = feature_names[i] if i < len(feature_names) else f"f{i}"
         print(f"  {name:16s} {model.weights[i]:+.4f}")
+
+
+# ============================================================
+# RESULTS STORAGE + TRAINING FROM HISTORY
+# ============================================================
+
+def trade_to_features(t: PaperTrade) -> np.ndarray:
+    """Build the exit-model feature vector from a closed paper trade."""
+    return np.array([
+        t.entry_z,
+        abs(t.entry_z),
+        t.pnl_z,
+        t.bars_held / 30.0,
+        0.7,   # confidence placeholder until live features are wired
+        0.1,   # velocity placeholder
+        abs(t.exit_z) if t.exit_z is not None else 0.0,
+        abs(t.exit_z) if t.exit_z is not None else 0.0,
+        abs(t.entry_z),
+        1.0,
+    ], dtype=float)
+
+
+def trade_to_label(t: PaperTrade) -> int:
+    """1 = exit was reasonable (profit or time stop)."""
+    return 1 if t.pnl_z > 0 or t.bars_held > 20 else 0
+
+
+def closed_trades_to_frame(closed_trades: Sequence[PaperTrade], run_id: str = "") -> pd.DataFrame:
+    rows = []
+    for t in closed_trades:
+        feat = trade_to_features(t)
+        row = {
+            "run_id": run_id,
+            "trade_id": t.trade_id,
+            "ticker_a": t.ticker_a,
+            "ticker_b": t.ticker_b,
+            "basket": t.basket,
+            "direction": t.direction,
+            "entry_time": t.entry_time,
+            "exit_time": t.exit_time,
+            "entry_z": t.entry_z,
+            "exit_z": t.exit_z,
+            "entry_spread": t.entry_spread,
+            "exit_spread": t.exit_spread,
+            "bars_held": t.bars_held,
+            "pnl_z": t.pnl_z,
+            "ml_proba_at_exit": t.ml_proba_at_exit,
+            "label": trade_to_label(t),
+        }
+        for name, val in zip(FEATURE_NAMES, feat):
+            row[f"feat_{name}"] = val
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def save_paper_results(
+    closed_trades: Sequence[PaperTrade],
+    results_dir: Path = RESULTS_DIR,
+    run_id: Optional[str] = None,
+) -> Tuple[Path, Path]:
+    """
+    Append closed trades to a journal CSV and write/append the training dataset.
+    Returns (trades_csv_path, dataset_csv_path).
+    """
+    results_dir = Path(results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    run_id = run_id or pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+    frame = closed_trades_to_frame(closed_trades, run_id=run_id)
+    trades_path = results_dir / "paper_trades.csv"
+    dataset_path = results_dir / "exit_training_dataset.csv"
+
+    # Full journal (append across sessions)
+    if trades_path.exists():
+        prev = pd.read_csv(trades_path)
+        journal = pd.concat([prev, frame], ignore_index=True)
+    else:
+        journal = frame
+    journal.to_csv(trades_path, index=False)
+
+    # Training dataset = feature columns + label (append)
+    feat_cols = [f"feat_{n}" for n in FEATURE_NAMES]
+    ds = frame[["run_id", "trade_id", "ticker_a", "ticker_b", "basket", *feat_cols, "label"]]
+    if dataset_path.exists():
+        prev_ds = pd.read_csv(dataset_path)
+        ds = pd.concat([prev_ds, ds], ignore_index=True)
+    ds.to_csv(dataset_path, index=False)
+
+    print(f"\n💾 Saved {len(closed_trades)} trades → {trades_path}")
+    print(f"💾 Training dataset rows: {len(ds)} → {dataset_path}")
+    return trades_path, dataset_path
+
+
+def load_training_dataset(dataset_path: Path = DATASET_CSV) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    path = Path(dataset_path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"No stored dataset at {path}. Run a paper session first to create it."
+        )
+    ds = pd.read_csv(path)
+    feat_cols = [f"feat_{n}" for n in FEATURE_NAMES]
+    missing = [c for c in feat_cols + ["label"] if c not in ds.columns]
+    if missing:
+        raise ValueError(f"Dataset missing columns: {missing}")
+    X = ds[feat_cols].to_numpy(dtype=float)
+    y = ds["label"].to_numpy(dtype=float)
+    return X, y, ds
+
+
+def train_from_stored_results(
+    dataset_path: Path = DATASET_CSV,
+    model_path: Path = MODEL_JSON,
+    reg: float = 0.3,
+    min_samples: int = 2,
+) -> LogisticExitModel:
+    """Load accumulated paper-trade features and fit the exit model."""
+    X, y, ds = load_training_dataset(dataset_path)
+    if len(y) < min_samples:
+        raise ValueError(f"Need at least {min_samples} samples; found {len(y)} in {dataset_path}")
+
+    print(f"\nTraining from stored results: {len(y)} samples ({dataset_path})")
+    print(f"  Baskets: {sorted(ds['basket'].dropna().unique().tolist()) if 'basket' in ds else 'n/a'}")
+    model = LogisticExitModel()
+    model.fit(X, y, reg=reg)
+    out = model.save(model_path)
+    print(f"✅ Model trained and saved → {out}")
+    analyze_feature_importance(model, FEATURE_NAMES)
+    return model
 
 # ============================================================
 # PAPER TRADING ENGINE
@@ -525,44 +689,10 @@ def run_paper_trading_and_train(
         print("Not enough trades generated. Try increasing n_bars or relaxing entry thresholds.")
         return trader, None, df_out
 
-    # 5. Train ML model on the paper trades
-    print("\nTraining ML Exit Model on paper trades...")
-
-    X_list = []
-    y_list = []
-
-    for t in closed_trades:
-        feat = np.array([
-            t.entry_z,
-            abs(t.entry_z),
-            t.pnl_z,                    # progress proxy
-            t.bars_held / 30.0,
-            0.7,                        # dummy confidence
-            0.1,                        # dummy velocity
-            abs(t.exit_z),
-            abs(t.exit_z),
-            abs(t.entry_z),
-            1.0
-        ])
-        X_list.append(feat)
-
-        label = 1 if t.pnl_z > 0 or t.bars_held > 20 else 0
-        y_list.append(label)
-
-    X = np.array(X_list)
-    y = np.array(y_list)
-
-    model = LogisticExitModel()
-    model.fit(X, y, reg=0.3)
-
-    print("\n✅ Model trained successfully on paper trades.")
-    print(f"Number of training samples: {len(y)}")
-
-    feature_names = [
-        "entry_z", "abs_entry_z", "pnl_proxy", "bars_held", "confidence",
-        "velocity", "exit_z", "favorable", "best_fav", "vol"
-    ]
-    analyze_feature_importance(model, feature_names)
+    # 5. Persist results, then train (from this run + any prior stored history)
+    save_paper_results(closed_trades)
+    print("\nTraining ML Exit Model on stored paper trades...")
+    model = train_from_stored_results()
 
     return trader, model, df_out
 
@@ -570,17 +700,35 @@ def run_paper_trading_and_train(
 # RUN IT
 # ============================================================
 if __name__ == "__main__":
-    trader, model, data = run_paper_trading_and_train(
-        n_bars=700,
-        min_trades=4,  # cover Mag7 / semis / memory / hyperscaler when signals appear
-        baskets=["mag7", "semis", "memory", "hyperscaler"],
-        include_cross=True,
-    )
+    import argparse
 
-    if model is None:
-        print("\n⚠️ Paper trading finished without enough trades to train.")
+    parser = argparse.ArgumentParser(description="Paper trading + ML exit trainer")
+    parser.add_argument(
+        "--train-only",
+        action="store_true",
+        help="Skip paper session; retrain from results/exit_training_dataset.csv",
+    )
+    parser.add_argument("--n-bars", type=int, default=700)
+    parser.add_argument("--min-trades", type=int, default=4)
+    args = parser.parse_args()
+
+    if args.train_only:
+        model = train_from_stored_results()
+        print("\n🎯 Retrain complete from stored results.")
     else:
-        print("\n🎯 Paper trading session complete.")
-        print("You now have a trained model and a trade journal.")
-        print("Universe covered: Mag7, semis, memory, hyperscaler.")
-        print("Copy this file into Cursor and continue developing.")
+        trader, model, data = run_paper_trading_and_train(
+            n_bars=args.n_bars,
+            min_trades=args.min_trades,
+            baskets=["mag7", "semis", "memory", "hyperscaler"],
+            include_cross=True,
+        )
+
+        if model is None:
+            print("\n⚠️ Paper trading finished without enough trades to train.")
+        else:
+            print("\n🎯 Paper trading session complete.")
+            print(f"   Journal:  {TRADES_CSV}")
+            print(f"   Dataset:  {DATASET_CSV}")
+            print(f"   Model:    {MODEL_JSON}")
+            print("Universe covered: Mag7, semis, memory, hyperscaler.")
+            print("Next: python paper_trading_ml_exit.py --train-only")
