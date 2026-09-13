@@ -6,10 +6,10 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    # 6× weekdays across US extended hours (pre / RTH / post), approx Eastern (UTC-4 / EDT).
-    # Times ET: 4:00, 7:00, 10:00, 13:00, 16:00, 19:00 (pre → post, markets open 4:00–20:00 ET).
+    # 6× weekdays during US regular hours only (9:30–16:00 ET). No pre/post.
+    # Times ET: 10:05, 11:05, 12:05, 13:05, 14:05, 15:05. Cron is UTC for EDT (UTC−4).
     # During EST these fire 1 hour later local time. Weekends skipped.
-    - cron: "0 8,11,14,17,20,23 * * 1-5"
+    - cron: "5 14,15,16,17,18,19 * * 1-5"
 
 jobs:
   run-paper-trading:

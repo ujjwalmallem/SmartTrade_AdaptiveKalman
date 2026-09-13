@@ -13,26 +13,30 @@ Create these at: https://cursor.com/automations
 5. Save / activate
 6. Repeat for each cron below (6 weekday runs)
 
-## Schedule (US extended hours)
+## Schedule (US regular market hours only)
+
+NYSE/Nasdaq RTH is **9:30–16:00 ET**, weekdays. No pre-market or after-hours runs.
 
 Times are Eastern. Cron is UTC for **EDT (UTC−4)**. In **EST (UTC−5)** add +1 hour to each UTC value.
 
 | Session | ET | UTC (EDT) | Cron |
 |---|---|---|---|
-| Pre-market | 4:05 | 08:05 | `5 8 * * 1-5` |
-| Pre-market | 7:05 | 11:05 | `5 11 * * 1-5` |
-| Regular | 10:05 | 14:05 | `5 14 * * 1-5` |
-| Regular | 13:05 | 17:05 | `5 17 * * 1-5` |
-| Post-market | 16:05 | 20:05 | `5 20 * * 1-5` |
-| Post-market | 19:05 | 23:05 | `5 23 * * 1-5` |
+| Open | 10:05 | 14:05 | `5 14 * * 1-5` |
+| Mid-morning | 11:05 | 15:05 | `5 15 * * 1-5` |
+| Midday | 12:05 | 16:05 | `5 16 * * 1-5` |
+| Early afternoon | 13:05 | 17:05 | `5 17 * * 1-5` |
+| Mid afternoon | 14:05 | 18:05 | `5 18 * * 1-5` |
+| Before close | 15:05 | 19:05 | `5 19 * * 1-5` |
+
+One-automation alternative: `5 14,15,16,17,18,19 * * 1-5`
 
 Suggested automation names:
-- `paper-trading-pre-0405`
-- `paper-trading-pre-0705`
 - `paper-trading-rth-1005`
+- `paper-trading-rth-1105`
+- `paper-trading-rth-1205`
 - `paper-trading-rth-1305`
-- `paper-trading-post-1605`
-- `paper-trading-post-1905`
+- `paper-trading-rth-1405`
+- `paper-trading-rth-1505`
 
 ## Notes
 

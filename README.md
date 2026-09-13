@@ -21,7 +21,7 @@ Use **Cursor Automations** for market-hour runs (more controllable than GitHub `
 
 Setup guide + paste-ready prompt: [`automations/README.md`](automations/README.md)
 
-Create 6 weekday automations (pre / RTH / post), cron in UTC, prompt from [`automations/paper-trading.prompt.md`](automations/paper-trading.prompt.md).
+Create 6 weekday automations during regular hours (10:05–15:05 ET), cron in UTC, prompt from [`automations/paper-trading.prompt.md`](automations/paper-trading.prompt.md).
 
 ## Backup: GitHub Actions
 
