@@ -1,0 +1,50 @@
+name: Paper Trading CI
+
+on:
+  push:
+    branches: [main, "cursor/**"]
+  pull_request:
+    branches: [main]
+  schedule:
+    # 6× weekdays across US extended hours (pre / RTH / post), approx Eastern (UTC-4 / EDT).
+    # Times ET: 4:00, 7:00, 10:00, 13:00, 16:00, 19:00 (pre → post, markets open 4:00–20:00 ET).
+    # During EST these fire 1 hour later local time. Weekends skipped.
+    - cron: "0 8,11,14,17,20,23 * * 1-5"
+
+jobs:
+  run-paper-trading:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check
+        run: python -m py_compile paper_trading_ml_exit.py
+
+      - name: Run paper trading + ML exit trainer
+        run: python paper_trading_ml_exit.py
+
+      - name: Retrain from stored results
+        run: python paper_trading_ml_exit.py --train-only
+
+      - name: Upload results artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: paper-trading-results
+          path: |
+            results/paper_trades.csv
+            results/exit_training_dataset.csv
+            results/logistic_exit_model.json
+          if-no-files-found: warn
