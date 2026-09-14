@@ -10,6 +10,9 @@ on:
     # Times ET: 4:00, 7:00, 10:00, 13:00, 16:00, 19:00 (pre → post, markets open 4:00–20:00 ET).
     # During EST these fire 1 hour later local time. Weekends skipped.
     - cron: "0 8,11,14,17,20,23 * * 1-5"
+  # Allows an external scheduler (e.g. the Cloudflare Worker in cloudflare-scheduler/)
+  # to kick off a run via the GitHub API in addition to the built-in schedule above.
+  workflow_dispatch: {}
 
 jobs:
   run-paper-trading:

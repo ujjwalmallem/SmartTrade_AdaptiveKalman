@@ -1,0 +1,17 @@
+name = "smarttrade-paper-trading-scheduler"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+# Same cadence as the workflow's own GitHub Actions `schedule:` trigger
+# (6x weekdays across pre/RTH/post US hours, UTC). Both schedulers firing
+# at the same times means the workflow can run twice back to back; adjust
+# one of the two schedules (or remove GitHub's `schedule:` block) if you
+# only want a single scheduler driving this.
+[triggers]
+crons = ["0 8,11,14,17,20,23 * * 1-5"]
+
+[vars]
+GITHUB_OWNER = "ujjwalmallem"
+GITHUB_REPO = "smarttrade_adaptivekalman"
+GITHUB_WORKFLOW_FILE = "paper-trading.yml"
+GITHUB_REF = "main"
