@@ -5,10 +5,13 @@ on:
     branches: [main, "cursor/**"]
   pull_request:
     branches: [main]
-  # Scheduling now lives in the Cloudflare Worker (cloudflare-scheduler/),
-  # which calls the GitHub API to dispatch this workflow 6x weekdays across
-  # US extended hours. workflow_dispatch is what it calls into.
+  # Scheduling is external (see cron-job.org), which calls the GitHub API to
+  # dispatch this workflow 6x weekdays across US extended hours.
+  # workflow_dispatch is what it calls into.
   workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 jobs:
   run-paper-trading:
@@ -31,6 +34,19 @@ jobs:
       - name: Syntax check
         run: python -m py_compile paper_trading_ml_exit.py
 
+      - name: Restore accumulated results from results-data branch
+        run: |
+          mkdir -p results
+          git fetch --depth=1 origin results-data 2>/dev/null || echo "No results-data branch yet (first run)"
+          if git rev-parse --verify origin/results-data >/dev/null 2>&1; then
+            for f in results/paper_trades.csv results/exit_training_dataset.csv; do
+              if git cat-file -e "origin/results-data:$f" 2>/dev/null; then
+                git show "origin/results-data:$f" > "$f"
+              fi
+            done
+            echo "Restored prior results (if present)."
+          fi
+
       - name: Run paper trading + ML exit trainer
         run: python paper_trading_ml_exit.py
 
@@ -47,3 +63,36 @@ jobs:
             results/exit_training_dataset.csv
             results/logistic_exit_model.json
           if-no-files-found: warn
+
+      - name: Publish accumulated results to results-data branch
+        if: always()
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Preserve the freshly generated files before switching branches
+          # (results/ is gitignored on this branch, so it must be cleared
+          # before checkout or it collides with results-data's tracked copy).
+          mkdir -p /tmp/results-out
+          cp -f results/*.csv results/*.json /tmp/results-out/ 2>/dev/null || true
+          rm -rf results
+
+          git fetch --depth=1 origin results-data 2>/dev/null || true
+          if git rev-parse --verify origin/results-data >/dev/null 2>&1; then
+            git checkout -B results-data origin/results-data
+          else
+            git checkout --orphan results-data
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          mkdir -p results
+          cp -f /tmp/results-out/* results/ 2>/dev/null || true
+
+          git add results
+          if git diff --cached --quiet; then
+            echo "No changes to persist."
+          else
+            git commit -m "Update accumulated paper-trading results"
+            git push origin HEAD:results-data
+          fi
