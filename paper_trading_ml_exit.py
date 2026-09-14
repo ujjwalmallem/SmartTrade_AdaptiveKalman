@@ -252,6 +252,80 @@ def generate_synthetic_prices_for_universe(
         prices[ticker] = level * np.exp(np.cumsum(rets + resid))
     return pd.DataFrame(prices, index=idx)
 
+
+def fetch_real_prices_for_universe(
+    tickers: Sequence[str],
+    n_bars: int = 700,
+    period: str = "3y",
+) -> pd.DataFrame:
+    """
+    Real daily close prices for the given tickers via yfinance, aligned on a
+    shared trading-day index (only days every ticker has a price for).
+    Returns the most recent `n_bars` rows. Raises on any fetch/shape problem
+    so the caller can decide how to handle it (see _load_prices_for_universe).
+    """
+    import yfinance as yf
+
+    tickers = list(dict.fromkeys(tickers))  # de-dup, preserve order
+    raw = yf.download(
+        tickers=tickers,
+        period=period,
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=True,
+        progress=False,
+        threads=True,
+    )
+    if raw is None or raw.empty:
+        raise RuntimeError("yfinance returned no data")
+
+    closes: Dict[str, pd.Series] = {}
+    for t in tickers:
+        try:
+            series = raw[t]["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw["Close"]
+        except KeyError:
+            continue
+        series = series.dropna()
+        if len(series) > 0:
+            closes[t] = series
+
+    missing = [t for t in tickers if t not in closes]
+    if missing:
+        print(f"⚠️  No usable close prices from yfinance for: {', '.join(missing)}")
+    if not closes:
+        raise RuntimeError("yfinance returned no usable close prices for any ticker")
+
+    prices = pd.DataFrame(closes).dropna(how="any")
+    if prices.empty:
+        raise RuntimeError("No overlapping trading days across fetched tickers")
+
+    return prices.tail(n_bars)
+
+
+def _load_prices_for_universe(
+    tickers: Sequence[str],
+    n_bars: int,
+    mode: str = "auto",
+) -> Tuple[pd.DataFrame, str]:
+    """
+    mode: "live" (fetch real data, raise on failure), "synthetic" (skip live
+    entirely), or "auto" (try live, fall back to synthetic on any failure).
+    Returns (prices, source_label) — source_label is recorded on every trade
+    row so a synthetic-fallback run is visible in the stored results instead
+    of silently looking like live data.
+    """
+    if mode in ("auto", "live"):
+        try:
+            prices = fetch_real_prices_for_universe(tickers, n_bars=n_bars)
+            if len(prices) < 100:
+                raise RuntimeError(f"only {len(prices)} usable bars (<100)")
+            return prices, "yfinance_live"
+        except Exception as exc:
+            if mode == "live":
+                raise
+            print(f"⚠️  Live data fetch failed ({exc}); falling back to synthetic data.")
+    return generate_synthetic_prices_for_universe(tickers, n=n_bars, seed=42), "synthetic_fallback"
+
 # Very simplified Kalman for demo (replace with full AdaptiveKalmanPairs)
 class SimpleKalmanPairs:
     def __init__(self):
@@ -364,12 +438,15 @@ def trade_to_label(t: PaperTrade) -> int:
     return 1 if t.pnl_z > 0 or t.bars_held > 20 else 0
 
 
-def closed_trades_to_frame(closed_trades: Sequence[PaperTrade], run_id: str = "") -> pd.DataFrame:
+def closed_trades_to_frame(
+    closed_trades: Sequence[PaperTrade], run_id: str = "", data_source: str = ""
+) -> pd.DataFrame:
     rows = []
     for t in closed_trades:
         feat = trade_to_features(t)
         row = {
             "run_id": run_id,
+            "data_source": data_source,
             "trade_id": t.trade_id,
             "ticker_a": t.ticker_a,
             "ticker_b": t.ticker_b,
@@ -396,6 +473,7 @@ def save_paper_results(
     closed_trades: Sequence[PaperTrade],
     results_dir: Path = RESULTS_DIR,
     run_id: Optional[str] = None,
+    data_source: str = "",
 ) -> Tuple[Path, Path]:
     """
     Append closed trades to a journal CSV and write/append the training dataset.
@@ -405,7 +483,7 @@ def save_paper_results(
     results_dir.mkdir(parents=True, exist_ok=True)
     run_id = run_id or pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
-    frame = closed_trades_to_frame(closed_trades, run_id=run_id)
+    frame = closed_trades_to_frame(closed_trades, run_id=run_id, data_source=data_source)
     trades_path = results_dir / "paper_trades.csv"
     dataset_path = results_dir / "exit_training_dataset.csv"
 
@@ -419,7 +497,7 @@ def save_paper_results(
 
     # Training dataset = feature columns + label (append)
     feat_cols = [f"feat_{n}" for n in FEATURE_NAMES]
-    ds = frame[["run_id", "trade_id", "ticker_a", "ticker_b", "basket", *feat_cols, "label"]]
+    ds = frame[["run_id", "data_source", "trade_id", "ticker_a", "ticker_b", "basket", *feat_cols, "label"]]
     if dataset_path.exists():
         prev_ds = pd.read_csv(dataset_path)
         ds = pd.concat([prev_ds, ds], ignore_index=True)
@@ -638,6 +716,7 @@ def run_paper_trading_and_train(
     baskets: Optional[Sequence[str]] = None,
     include_cross: bool = True,
     max_pairs_per_basket: int = 6,
+    data_source_mode: str = "auto",
 ):
     print("Starting Paper Trading Session...")
     print("Goal: Complete at least", min_trades, "round-trip trades\n")
@@ -651,10 +730,11 @@ def run_paper_trading_and_train(
     )
     summarize_universes(pairs)
 
-    # 1. Synthetic prices for all tickers in the active universe
+    # 1. Prices for all tickers in the active universe: real (yfinance) by
+    # default, falling back to synthetic if the fetch fails (mode="auto").
     tickers = all_universe_tickers(baskets)
-    prices = generate_synthetic_prices_for_universe(tickers, n=n_bars, seed=42)
-    print(f"\nPrice panel: {prices.shape[1]} tickers × {prices.shape[0]} bars\n")
+    prices, data_source = _load_prices_for_universe(tickers, n_bars, mode=data_source_mode)
+    print(f"\nPrice panel: {prices.shape[1]} tickers × {prices.shape[0]} bars  [source: {data_source}]\n")
 
     # 2–3. Scan pairs with Kalman filter + paper trader
     trader = PaperTrader()
@@ -690,7 +770,7 @@ def run_paper_trading_and_train(
         return trader, None, df_out
 
     # 5. Persist results, then train (from this run + any prior stored history)
-    save_paper_results(closed_trades)
+    save_paper_results(closed_trades, data_source=data_source)
     print("\nTraining ML Exit Model on stored paper trades...")
     model = train_from_stored_results()
 
@@ -710,6 +790,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--n-bars", type=int, default=700)
     parser.add_argument("--min-trades", type=int, default=4)
+    parser.add_argument(
+        "--data-source",
+        choices=["auto", "live", "synthetic"],
+        default="auto",
+        help=(
+            "auto (default): fetch real prices via yfinance, fall back to "
+            "synthetic on failure. live: require real data, error out if "
+            "the fetch fails. synthetic: skip live data entirely."
+        ),
+    )
     args = parser.parse_args()
 
     if args.train_only:
@@ -721,6 +811,7 @@ if __name__ == "__main__":
             min_trades=args.min_trades,
             baskets=["mag7", "semis", "memory", "hyperscaler"],
             include_cross=True,
+            data_source_mode=args.data_source,
         )
 
         if model is None:
