@@ -15,14 +15,23 @@ Artifacts land in `results/` (gitignored):
 - `exit_training_dataset.csv`
 - `logistic_exit_model.json`
 
-## Scheduler: Cursor Automations (primary)
+## Scheduler: Cloudflare Cron → GitHub Actions (primary)
 
-Use **Cursor Automations** for market-hour runs (more controllable than GitHub `schedule`).
+Use a **Cloudflare Worker** cron to dispatch the GitHub Action on US extended-hours weekdays.
 
-Setup guide + paste-ready prompt: [`automations/README.md`](automations/README.md)
+Full setup: [`cloudflare/README.md`](cloudflare/README.md)
 
-Create 6 weekday automations (pre / RTH / post), cron in UTC, prompt from [`automations/paper-trading.prompt.md`](automations/paper-trading.prompt.md).
+```bash
+cd cloudflare
+npm install
+npx wrangler login
+npm run secret:github    # fine-grained PAT with Actions write
+npm run deploy
+```
 
-## Backup: GitHub Actions
+6 weekday crons fire `workflow_dispatch` on `.github/workflows/paper-trading.yml`.
 
-`.github/workflows/paper-trading.yml` still runs on push/PR and a soft UTC cron, and uploads `results/` as artifacts.
+## Other options
+
+- **Cursor Automations** (Cloud Agent runs the script): [`automations/README.md`](automations/README.md)
+- **GitHub `schedule`**: kept as a soft weekday backup only

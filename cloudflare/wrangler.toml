@@ -1,0 +1,24 @@
+name = "paper-trading-dispatcher"
+main = "src/index.js"
+compatibility_date = "2024-09-01"
+workers_dev = true
+
+# Repo identity (non-secret)
+[vars]
+GH_OWNER = "ujjwalmallem"
+GH_REPO = "SmartTrade_AdaptiveKalman"
+WORKFLOW_FILE = "paper-trading.yml"
+GH_REF = "main"
+
+# Cron is UTC. These match US extended hours under EDT (UTC-4):
+# ET 4:05, 7:05, 10:05, 13:05, 16:05, 19:05 on weekdays.
+# During EST (UTC-5) each fire is 1 hour later local time — adjust seasonally if needed.
+[triggers]
+crons = [
+  "5 8 * * 1-5",
+  "5 11 * * 1-5",
+  "5 14 * * 1-5",
+  "5 17 * * 1-5",
+  "5 20 * * 1-5",
+  "5 23 * * 1-5",
+]
