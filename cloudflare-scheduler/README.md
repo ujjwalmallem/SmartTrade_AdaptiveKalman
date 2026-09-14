@@ -1,8 +1,10 @@
 # Cloudflare scheduler for paper-trading.yml
 
 A small Cloudflare Worker whose Cron Trigger calls the GitHub API to fire
-the repo's `paper-trading.yml` workflow (`workflow_dispatch`), instead of
-(or in addition to) relying on GitHub Actions' own `schedule:` trigger.
+the repo's `paper-trading.yml` workflow (`workflow_dispatch`). This is now
+the sole scheduler for that workflow — `paper-trading.yml` no longer has
+its own `schedule:` block, so nothing runs until this Worker (or a manual
+`workflow_dispatch`/push/PR) triggers it.
 
 The Worker does **not** run the Python trading/ML code itself — Workers
 don't have a numpy/pandas-capable Python runtime. It only pokes GitHub to
@@ -49,12 +51,10 @@ start the job, which still runs on GitHub Actions.
 
    Then check the Actions tab for a new `workflow_dispatch` run.
 
-## Avoiding double runs
+## Important
 
-`paper-trading.yml` still has its own `schedule:` cron block. If this
-Worker's cron fires at the same times, the workflow will run twice per
-slot. Either:
-
-- stagger the two schedules, or
-- delete/comment out the `schedule:` block in `.github/workflows/paper-trading.yml`
-  once you're confident the Cloudflare-driven trigger is reliable.
+Since GitHub Actions' own `schedule:` trigger was removed, **if this
+Worker is undeployed, paused, or its `GITHUB_TOKEN` secret expires, no
+scheduled runs will happen at all** — only push/PR/manual runs. Keep an
+eye on the Worker (e.g. `wrangler tail`, or Cloudflare's dashboard logs)
+to confirm it's actually firing on schedule.

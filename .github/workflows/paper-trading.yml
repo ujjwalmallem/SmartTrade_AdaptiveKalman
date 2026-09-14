@@ -5,13 +5,9 @@ on:
     branches: [main, "cursor/**"]
   pull_request:
     branches: [main]
-  schedule:
-    # 6× weekdays across US extended hours (pre / RTH / post), approx Eastern (UTC-4 / EDT).
-    # Times ET: 4:00, 7:00, 10:00, 13:00, 16:00, 19:00 (pre → post, markets open 4:00–20:00 ET).
-    # During EST these fire 1 hour later local time. Weekends skipped.
-    - cron: "0 8,11,14,17,20,23 * * 1-5"
-  # Allows an external scheduler (e.g. the Cloudflare Worker in cloudflare-scheduler/)
-  # to kick off a run via the GitHub API in addition to the built-in schedule above.
+  # Scheduling now lives in the Cloudflare Worker (cloudflare-scheduler/),
+  # which calls the GitHub API to dispatch this workflow 6x weekdays across
+  # US extended hours. workflow_dispatch is what it calls into.
   workflow_dispatch: {}
 
 jobs:
