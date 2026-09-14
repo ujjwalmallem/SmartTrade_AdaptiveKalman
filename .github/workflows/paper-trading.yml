@@ -5,11 +5,19 @@ on:
     branches: [main, "cursor/**"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Who/what triggered this run"
+        required: false
+        default: "manual"
+  # Soft backup only — prefer Cloudflare Cron → workflow_dispatch
   schedule:
-    # 6× weekdays across US extended hours (pre / RTH / post), approx Eastern (UTC-4 / EDT).
-    # Times ET: 4:00, 7:00, 10:00, 13:00, 16:00, 19:00 (pre → post, markets open 4:00–20:00 ET).
-    # During EST these fire 1 hour later local time. Weekends skipped.
-    - cron: "0 8,11,14,17,20,23 * * 1-5"
+    - cron: "0 12 * * 1-5"
+
+concurrency:
+  group: paper-trading-ci
+  cancel-in-progress: false
 
 jobs:
   run-paper-trading:
@@ -42,7 +50,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: paper-trading-results
+          name: paper-trading-results-${{ github.run_id }}
           path: |
             results/paper_trades.csv
             results/exit_training_dataset.csv
