@@ -200,15 +200,16 @@ class PositionState:
 def fetch_real_prices_for_universe(
     tickers: Sequence[str],
     n_bars: int = 700,
-    period: str = "3y",
-    min_bars: int = 100,
+    period: str = "2y",
+    min_bars: int = 80,
+    trade_year: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Real daily close prices via yfinance only (no synthetic data).
 
-    Aligns tickers on shared trading days, drops names with no usable closes,
-    and returns the most recent `n_bars` rows. Raises if the fetch fails or
-    yields too little history — training must not silently invent prices.
+    Aligns tickers on shared trading days. Keeps enough history for indicator
+    warm-up, but trade windows are restricted to `trade_year` (default: the
+    calendar year of the latest bar — e.g. 2026, not prior years).
     """
     import yfinance as yf
 
@@ -245,33 +246,58 @@ def fetch_real_prices_for_universe(
             "cannot build pairs for training"
         )
 
-    # Align on intersection of trading days across surviving tickers, then
-    # keep the most recent window. Pair scans skip any ticker not present.
     prices = pd.DataFrame(closes).dropna(how="any")
-    if len(prices) < min_bars:
+    if prices.empty:
+        raise RuntimeError("No overlapping trading days across fetched tickers")
+
+    # Prefer a recent window that still leaves warm-up bars before trade_year.
+    prices = prices.tail(max(n_bars, min_bars + 60))
+
+    latest_year = int(pd.Timestamp(prices.index.max()).year)
+    year = int(trade_year) if trade_year is not None else latest_year
+    if year != latest_year:
+        print(f"⚠️  Requested trade_year={year} but latest bar is {latest_year}; using {latest_year}")
+        year = latest_year
+
+    in_year = prices.index.year == year
+    if not in_year.any():
+        raise RuntimeError(f"No yfinance bars in latest year {year}")
+
+    # Keep prior-year warm-up (for rolling z/confidence) + all latest-year bars.
+    first_trade_i = int(in_year.argmax())  # first True
+    warm_start = max(0, first_trade_i - 60)
+    prices = prices.iloc[warm_start:]
+
+    trade_bars = int((prices.index.year == year).sum())
+    if trade_bars < 40:
         raise RuntimeError(
-            f"Only {len(prices)} overlapping yfinance bars (<{min_bars}); "
-            "refusing to train on insufficient real history"
+            f"Only {trade_bars} bars in trade year {year}; need more latest-year history"
         )
 
-    prices = prices.tail(n_bars)
     print(
         f"yfinance panel ready: {prices.shape[1]} tickers × {prices.shape[0]} bars "
-        f"[{prices.index.min().date()} → {prices.index.max().date()}]"
+        f"[{prices.index.min().date()} → {prices.index.max().date()}] "
+        f"(trades restricted to {year}: {trade_bars} bars)"
     )
+    prices.attrs["trade_year"] = year
     return prices
 
 
 def _load_prices_for_universe(
     tickers: Sequence[str],
     n_bars: int,
+    trade_year: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, str]:
     """
     Load prices for training. yfinance only — never synthesizes data.
+    Trade windows use the latest calendar year only.
     Returns (prices, source_label) for the results journal.
     """
-    prices = fetch_real_prices_for_universe(tickers, n_bars=n_bars)
+    prices = fetch_real_prices_for_universe(
+        tickers, n_bars=n_bars, trade_year=trade_year
+    )
     return prices, "yfinance_live"
+
 
 # Very simplified Kalman for demo (replace with full AdaptiveKalmanPairs)
 class SimpleKalmanPairs:
@@ -424,40 +450,75 @@ def save_paper_results(
 ) -> Tuple[Path, Path]:
     """
     Append closed trades to a journal CSV and write/append the training dataset.
+    Prior-year windows (e.g. 2025) are purged so only the latest year remains.
     Returns (trades_csv_path, dataset_csv_path).
     """
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     run_id = run_id or pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    year = _latest_allowed_trade_year()
 
     frame = closed_trades_to_frame(closed_trades, run_id=run_id, data_source=data_source)
     trades_path = results_dir / "paper_trades.csv"
     dataset_path = results_dir / "exit_training_dataset.csv"
 
-    # Full journal (append across sessions)
+    # Full journal (append, then keep latest year only)
     if trades_path.exists():
         prev = pd.read_csv(trades_path)
         journal = pd.concat([prev, frame], ignore_index=True)
     else:
         journal = frame
+    journal = filter_trades_to_latest_year(journal, trade_year=year)
     journal.to_csv(trades_path, index=False)
 
-    # Training dataset = feature columns + label (append)
+    # Training dataset = feature columns + label (append, then align to latest-year journal)
     feat_cols = [f"feat_{n}" for n in FEATURE_NAMES]
     ds = frame[["run_id", "data_source", "trade_id", "ticker_a", "ticker_b", "basket", *feat_cols, "label"]]
     if dataset_path.exists():
         prev_ds = pd.read_csv(dataset_path)
         ds = pd.concat([prev_ds, ds], ignore_index=True)
+    if not journal.empty and {"run_id", "trade_id"}.issubset(ds.columns):
+        keys = journal[["run_id", "trade_id"]].drop_duplicates()
+        ds = ds.merge(keys, on=["run_id", "trade_id"], how="inner")
+    elif journal.empty:
+        ds = ds.iloc[0:0]
     ds.to_csv(dataset_path, index=False)
 
-    print(f"\n💾 Saved {len(closed_trades)} trades → {trades_path}")
+    print(f"\n💾 Saved {len(closed_trades)} new trades → {trades_path}")
+    print(f"💾 Journal rows kept for {year}: {len(journal)}")
     print(f"💾 Training dataset rows: {len(ds)} → {dataset_path}")
     return trades_path, dataset_path
+
+
+def _latest_allowed_trade_year(now: Optional[pd.Timestamp] = None) -> int:
+    """Calendar year used for training/trade windows (never prior years)."""
+    return int(pd.Timestamp(now or pd.Timestamp.utcnow()).year)
+
+
+def filter_trades_to_latest_year(
+    trades: pd.DataFrame,
+    trade_year: Optional[int] = None,
+) -> pd.DataFrame:
+    """Keep only rows whose entry and exit fall in the latest calendar year."""
+    if trades.empty:
+        return trades
+    year = trade_year if trade_year is not None else _latest_allowed_trade_year()
+    entry = pd.to_datetime(trades["entry_time"], format="mixed")
+    exit_ = pd.to_datetime(trades["exit_time"], format="mixed")
+    mask = entry.dt.year.eq(year) & exit_.dt.year.eq(year)
+    kept = trades.loc[mask].copy()
+    dropped = len(trades) - len(kept)
+    if dropped:
+        print(f"⚠️  Dropped {dropped} trades outside latest year {year}")
+    return kept
 
 
 def load_training_dataset(
     dataset_path: Path = DATASET_CSV,
     require_live: bool = True,
+    latest_year_only: bool = True,
+    trades_path: Path = TRADES_CSV,
+    trade_year: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     path = Path(dataset_path)
     if not path.exists():
@@ -481,6 +542,31 @@ def load_training_dataset(
             raise ValueError(
                 "No yfinance rows left in the training dataset. "
                 "Re-run paper trading to collect real-price samples."
+            )
+
+    # Drop any stored windows from prior years (e.g. 2025) — latest year only.
+    if latest_year_only:
+        year = trade_year if trade_year is not None else _latest_allowed_trade_year()
+        tpath = Path(trades_path)
+        if tpath.exists() and {"run_id", "trade_id"}.issubset(ds.columns):
+            journal = pd.read_csv(tpath)
+            journal = filter_trades_to_latest_year(journal, trade_year=year)
+            keys = journal[["run_id", "trade_id"]].drop_duplicates()
+            before = len(ds)
+            ds = ds.merge(keys, on=["run_id", "trade_id"], how="inner")
+            dropped = before - len(ds)
+            if dropped:
+                print(f"⚠️  Dropped {dropped} training rows not in latest year {year}")
+        elif "entry_time" in ds.columns and "exit_time" in ds.columns:
+            before = len(ds)
+            ds = filter_trades_to_latest_year(ds, trade_year=year)
+            dropped = before - len(ds)
+            if dropped:
+                print(f"⚠️  Dropped {dropped} training rows outside year {year}")
+        if ds.empty:
+            raise ValueError(
+                f"No training rows left for latest year {year}. "
+                "Re-run paper trading on latest-year windows."
             )
 
     X = ds[feat_cols].to_numpy(dtype=float)
@@ -619,11 +705,18 @@ def _trade_pair_session(
     pair: PairSpec,
     min_trades: int,
     trades_remaining: int,
+    trade_year: Optional[int] = None,
 ) -> int:
-    """Run rule-based entries/exits on one pair; return number of new closed trades."""
+    """Run rule-based entries/exits on one pair; return number of new closed trades.
+
+    Entries are allowed only in `trade_year` (latest calendar year). Prior-year
+    bars may exist for indicator warm-up but never open a 2025 (or older) window.
+    """
     position = 0
     entry_idx = 0
     opened = 0
+    if trade_year is None:
+        trade_year = int(pd.Timestamp(df.index.max()).year)
 
     for i in range(60, len(df)):
         if opened >= trades_remaining:
@@ -632,8 +725,11 @@ def _trade_pair_session(
         z = row["zscore"]
         conf = row["confidence"]
         time = df.index[i]
+        in_trade_year = int(pd.Timestamp(time).year) == int(trade_year)
 
         if position == 0:
+            if not in_trade_year:
+                continue
             if z < -2.0 and conf > 0.55:
                 position = 1
                 entry_idx = i
@@ -695,10 +791,12 @@ def run_paper_trading_and_train(
     )
     summarize_universes(pairs)
 
-    # 1. Prices: yfinance only (hard fail — never synthesize for training)
+    # 1. Prices: yfinance only; trades restricted to latest calendar year
     tickers = all_universe_tickers(baskets)
     prices, data_source = _load_prices_for_universe(tickers, n_bars)
-    print(f"\nPrice panel: {prices.shape[1]} tickers × {prices.shape[0]} bars  [source: {data_source}]\n")
+    trade_year = int(prices.attrs.get("trade_year", pd.Timestamp(prices.index.max()).year))
+    print(f"\nPrice panel: {prices.shape[1]} tickers × {prices.shape[0]} bars  [source: {data_source}]")
+    print(f"Trade windows: {trade_year} only (no prior-year entries)\n")
 
     # 2–3. Scan pairs with Kalman filter + paper trader
     trader = PaperTrader()
@@ -715,17 +813,23 @@ def run_paper_trading_and_train(
         price_b = prices[pair.ticker_b]
         df = kf.filter_pair(price_a, price_b)
         pair_frames[pair.label] = df
-        print(f"\n--- Scanning {pair.label} [{pair.basket}] ---")
+        print(f"\n--- Scanning {pair.label} [{pair.basket}] (year={trade_year}) ---")
         # At most one round-trip per pair so we rotate across Mag7 / semis / memory / hyperscaler
         opened = _trade_pair_session(
             trader, df, pair,
             min_trades=min_trades,
             trades_remaining=1,
+            trade_year=trade_year,
         )
         closed_count += opened
 
-    # 4. Show journal
+    # 4. Show journal (latest-year trades only)
     closed_trades = trader.summary()
+    closed_trades = [
+        t for t in closed_trades
+        if int(pd.Timestamp(t.entry_time).year) == trade_year
+        and int(pd.Timestamp(t.exit_time).year) == trade_year
+    ]
     # Use last scanned frame for return compatibility; prefer first if empty
     df_out = next(iter(pair_frames.values())) if pair_frames else prices
 

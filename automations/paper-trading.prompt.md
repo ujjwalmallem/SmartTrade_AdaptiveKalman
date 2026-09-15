@@ -24,11 +24,13 @@ You are running a scheduled paper-trading session for Mag7, semis, memory, and h
    - Win rate / avg PnL(z) if available
    - Whether model training succeeded
    - Confirm `data_source` is `yfinance_live` (required for training)
+   - Confirm trade entry/exit dates are in the **latest calendar year only** (no 2025 or earlier windows)
    - Any errors or empty-result conditions
 
 ## Rules
 
 - Do **not** open a PR unless the run fails and you made a real code fix.
 - Prices must come from **yfinance only**. The script has no synthetic fallback — if the fetch fails, the run must fail. Never invent prices or fills.
+- Trade windows must be in the **latest year only**; drop/ignore any prior-year (e.g. 2025) results.
 - If fewer than 2 trades are generated, report that clearly and stop (no fake training).
 - Keep the reply short and operational.
