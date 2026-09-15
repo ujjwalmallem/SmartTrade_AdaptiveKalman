@@ -8,11 +8,18 @@ Paper trading + ML exit trainer for **Mag7 / semis / memory / hyperscaler** pair
 pip install -r requirements.txt
 python paper_trading_ml_exit.py --mode backtest --broker sim   # replay history → ML journal
 python paper_trading_ml_exit.py --mode live --broker alpaca    # fresh data → latest-bar Alpaca paper orders
+python paper_trading_ml_exit.py --mode research                # counterfactual setups → results/setups_*.csv
+python paper_trading_ml_exit.py --mode research --data-window latest_year
 python paper_trading_ml_exit.py --data-source auto             # Alpaca primary, yfinance backup
 python paper_trading_ml_exit.py --data-source yfinance         # force Yahoo backup
 python paper_trading_ml_exit.py --noise-model volume
 python paper_trading_ml_exit.py --train-only
 ```
+
+**Modes:**
+- `backtest` — historical sim fills for the ML journal (`paper_trades.csv`)
+- `live` — latest-bar Alpaca paper orders only
+- `research` — simulate every valid z-crossing to completion into `results/setups_*.csv` (no broker, does not touch the live journal)
 
 **Brokerage:** default is a local simulator. With `--broker alpaca`, entry/exit on the **latest bar only** are submitted to the Alpaca **paper** API (never live).
 
