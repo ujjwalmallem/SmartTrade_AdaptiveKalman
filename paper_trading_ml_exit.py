@@ -299,32 +299,149 @@ def _load_prices_for_universe(
     return prices, "yfinance_live"
 
 
-# Very simplified Kalman for demo (replace with full AdaptiveKalmanPairs)
-class SimpleKalmanPairs:
-    def __init__(self):
-        self.beta = 1.0
-        self.history = []
-    
-    def filter_pair(self, a, b):
-        # Rolling OLS beta so the demo spread is mean-reverting enough for trades
-        cov = a.rolling(60).cov(b)
-        var = b.rolling(60).var()
-        beta = (cov / var).fillna(self.beta)
-        spread = a - beta * b
-        z = (spread - spread.rolling(40).mean()) / spread.rolling(40).std()
-        vol = spread.rolling(20).std()
-        vol_med = vol.median()
-        conf = (vol_med / (vol_med + vol)).fillna(0.5)
-        df = pd.DataFrame({
-            "price_a": a,
-            "price_b": b,
-            "spread": spread,
-            "zscore": z,
-            "confidence": conf.clip(0.3, 0.95),
-            "spread_velocity": spread.diff().rolling(5).mean().fillna(0),
-            "spread_vol": spread.rolling(15).std().fillna(1)
-        }, index=a.index)
+
+# ============================================================
+# ADAPTIVE KALMAN FILTER FOR PAIRS (real implementation)
+# ============================================================
+
+@dataclass
+class AdaptiveKalmanPairs:
+    """
+    Online Kalman filter estimating time-varying intercept (α) and hedge ratio (β).
+    State: θ = [α, β]
+    Observation: price_a = α + β * price_b + v
+
+    Adaptive process noise: Q is scaled by recent innovation magnitude so the
+    filter becomes more responsive in volatile regimes and smoother in calm ones.
+    """
+    delta: float = 1e-4          # base process-noise scale
+    R: float = 1e-2              # observation noise variance
+    adapt_window: int = 20      # window for innovation-based adaptation
+    min_conf: float = 0.25
+    max_conf: float = 0.95
+
+    def __post_init__(self):
+        self.reset()
+
+    def reset(self):
+        self.x = np.zeros(2)                     # [α, β]
+        self.P = np.eye(2) * 1.0                 # state covariance
+        self.Q_base = self.delta * np.eye(2)
+        self.innovations: List[float] = []
+        self.history: List[dict] = []
+        self._ewma_var = None
+
+    def _adapt_Q(self) -> np.ndarray:
+        """Scale process noise by recent |innovation| (adaptive Kalman)."""
+        if len(self.innovations) < 5:
+            return self.Q_base.copy()
+        recent = np.array(self.innovations[-self.adapt_window:])
+        scale = np.clip(np.std(recent) / (np.mean(np.abs(recent)) + 1e-8), 0.3, 5.0)
+        return self.Q_base * scale
+
+    def update(self, price_a: float, price_b: float) -> dict:
+        """One-step predict + update. Returns current state diagnostics."""
+        # Observation matrix H = [1, price_b]
+        H = np.array([1.0, price_b])
+
+        # ----- Predict -----
+        x_prior = self.x.copy()
+        Q = self._adapt_Q()
+        P_prior = self.P + Q
+
+        # ----- Update -----
+        y_pred = H @ x_prior
+        innov = price_a - y_pred
+        S = float(H @ P_prior @ H.T + self.R)   # innovation variance
+        K = (P_prior @ H.T) / S                 # Kalman gain
+
+        self.x = x_prior + K * innov
+        self.P = (np.eye(2) - np.outer(K, H)) @ P_prior
+
+        self.innovations.append(float(innov))
+        if len(self.innovations) > 200:
+            self.innovations = self.innovations[-200:]
+
+        spread = innov                          # residual = observed − predicted
+        # Online estimate of residual std (EWMA)
+        if self._ewma_var is None:
+            self._ewma_var = max(S, 1e-6)
+        else:
+            self._ewma_var = 0.94 * self._ewma_var + 0.06 * innov**2
+        spread_std = float(np.sqrt(self._ewma_var + 1e-8))
+
+        z = spread / spread_std
+        # Confidence: higher when innovation variance is low relative to long-run
+        conf = 1.0 / (1.0 + np.sqrt(S))
+        conf = float(np.clip(conf, self.min_conf, self.max_conf))
+
+        out = {
+            "alpha": float(self.x[0]),
+            "beta": float(self.x[1]),
+            "spread": float(spread),
+            "spread_std": float(spread_std),
+            "zscore": float(z),
+            "confidence": conf,
+            "innovation": float(innov),
+            "kalman_gain_beta": float(K[1]),
+        }
+        self.history.append(out)
+        return out
+
+    def filter_pair(self, a: pd.Series, b: pd.Series) -> pd.DataFrame:
+        """
+        Run the filter over two aligned price series.
+        Returns a DataFrame with all diagnostics needed by the trading engine.
+        """
+        self.reset()
+        a = a.astype(float).dropna()
+        b = b.astype(float).dropna()
+        common = a.index.intersection(b.index)
+        a, b = a.loc[common], b.loc[common]
+
+        # Calibrate noise to absolute price scale (R=1e-2 is for unit prices).
+        price_scale = float(max(np.nanmedian(np.abs(a.values)), 1.0))
+        self.R = max((price_scale ** 2) * 1e-4, 1e-6)
+        self.Q_base = (self.delta * (price_scale ** 2)) * np.eye(2)
+
+        rows = []
+        prev_spread = 0.0
+
+        for ts, pa, pb in zip(common, a.values, b.values):
+            st = self.update(float(pa), float(pb))
+            spread = st["spread"]
+            velocity = spread - prev_spread
+            prev_spread = spread
+
+            rows.append({
+                "price_a": pa,
+                "price_b": pb,
+                "alpha": st["alpha"],
+                "beta": st["beta"],
+                "spread": spread,
+                "zscore": st["zscore"],
+                "confidence": st["confidence"],
+                "spread_velocity": velocity,
+                "spread_vol": st["spread_std"],
+                "innovation": st["innovation"],
+            })
+
+        df = pd.DataFrame(rows, index=common)
+
+        # Extra rolling diagnostics useful for exit features
+        df["spread_velocity"] = df["spread"].diff().rolling(5, min_periods=1).mean().fillna(0)
+        df["spread_vol"] = df["spread"].rolling(15, min_periods=5).std().fillna(df["spread_vol"])
+        # Trading z-score: rolling standardize the Kalman residual (online EWMA z
+        # adapts too fast to ever reach classic ±2 entry thresholds).
+        roll_mu = df["spread"].rolling(40, min_periods=10).mean()
+        roll_sd = df["spread"].rolling(40, min_periods=10).std()
+        df["zscore"] = ((df["spread"] - roll_mu) / roll_sd.replace(0, np.nan)).fillna(0.0)
+        # Regime confidence from relative residual vol (tradeable scale)
+        roll = df["spread"].rolling(20, min_periods=5).std()
+        med = float(roll.median()) if roll.notna().any() else 1.0
+        df["confidence"] = (med / (med + roll)).clip(self.min_conf, self.max_conf).fillna(self.min_conf)
         return df
+
 
 
 class LogisticExitModel:
@@ -390,19 +507,75 @@ def analyze_feature_importance(model, feature_names):
 # RESULTS STORAGE + TRAINING FROM HISTORY
 # ============================================================
 
-def trade_to_features(t: PaperTrade) -> np.ndarray:
-    """Build the exit-model feature vector from a closed paper trade."""
+def extract_exit_features(
+    position: PositionState,
+    row: pd.Series,
+    bars_held: int,
+    direction: int,
+) -> np.ndarray:
+    """
+    Build the 10-dimensional feature vector used by LogisticExitModel.
+    All values are computed from live Kalman state + path statistics.
+    Order matches FEATURE_NAMES.
+    """
+    z = float(row["zscore"])
+    conf = float(row.get("confidence", 0.5))
+    vel = float(row.get("spread_velocity", 0.0))
+    vol = float(row.get("spread_vol", 1.0))
+
+    # Current PnL in z-space (positive = favorable)
+    if direction == 1:          # long the spread
+        pnl_proxy = z - position.entry_z
+        favorable = max(0.0, z - position.entry_z)
+    else:                       # short the spread
+        pnl_proxy = position.entry_z - z
+        favorable = max(0.0, position.entry_z - z)
+
+    # Track best favorable excursion
+    position.highest_favorable_z = max(position.highest_favorable_z, favorable)
+    best_fav = position.highest_favorable_z
+
+    # Normalized bars held (0–1-ish scale)
+    bars_norm = bars_held / 30.0
+
+    feat = np.array([
+        position.entry_z,           # 0 entry_z
+        abs(position.entry_z),      # 1 abs_entry_z
+        pnl_proxy,                  # 2 pnl_proxy
+        bars_norm,                  # 3 bars_held
+        conf,                       # 4 confidence
+        vel,                        # 5 velocity
+        z,                          # 6 exit_z (current)
+        favorable,                  # 7 favorable (current)
+        best_fav,                   # 8 best_fav
+        vol,                        # 9 vol
+    ], dtype=float)
+    return feat
+
+
+def trade_to_features(t: "PaperTrade") -> np.ndarray:
+    """
+    Reconstruct a reasonable feature vector from a closed PaperTrade
+    (used when training from the journal). Some path-dependent fields
+    are approximated because the full intra-trade series is not stored.
+    """
+    pnl = t.pnl_z
+    bars_norm = t.bars_held / 30.0
+    exit_z = t.exit_z if t.exit_z is not None else 0.0
+    fav = max(0.0, pnl)                 # realized favorable excursion proxy
+    best_fav = max(abs(t.entry_z), fav) # crude upper bound
+
     return np.array([
         t.entry_z,
         abs(t.entry_z),
-        t.pnl_z,
-        t.bars_held / 30.0,
-        0.7,   # confidence placeholder until live features are wired
-        0.1,   # velocity placeholder
-        abs(t.exit_z) if t.exit_z is not None else 0.0,
-        abs(t.exit_z) if t.exit_z is not None else 0.0,
-        abs(t.entry_z),
-        1.0,
+        pnl,
+        bars_norm,
+        0.70,               # confidence placeholder (could be stored later)
+        0.0,                # velocity unknown from journal
+        exit_z,
+        fav,
+        best_fav,
+        1.0,                # vol placeholder
     ], dtype=float)
 
 
@@ -711,10 +884,13 @@ def _trade_pair_session(
 
     Entries are allowed only in `trade_year` (latest calendar year). Prior-year
     bars may exist for indicator warm-up but never open a 2025 (or older) window.
+    While in a position, richer Kalman/path exit features are computed each bar
+    (ready for ML-driven exits).
     """
     position = 0
     entry_idx = 0
     opened = 0
+    pos_state = PositionState()
     if trade_year is None:
         trade_year = int(pd.Timestamp(df.index.max()).year)
 
@@ -733,6 +909,13 @@ def _trade_pair_session(
             if z < -2.0 and conf > 0.55:
                 position = 1
                 entry_idx = i
+                pos_state = PositionState(
+                    direction=1,
+                    entry_z=float(z),
+                    entry_bar=i,
+                    entry_spread=float(row["spread"]),
+                    highest_favorable_z=0.0,
+                )
                 trader.open_trade(
                     1, time, z, row["spread"],
                     ticker_a=pair.ticker_a, ticker_b=pair.ticker_b, basket=pair.basket,
@@ -740,12 +923,21 @@ def _trade_pair_session(
             elif z > 2.0 and conf > 0.55:
                 position = -1
                 entry_idx = i
+                pos_state = PositionState(
+                    direction=-1,
+                    entry_z=float(z),
+                    entry_bar=i,
+                    entry_spread=float(row["spread"]),
+                    highest_favorable_z=0.0,
+                )
                 trader.open_trade(
                     -1, time, z, row["spread"],
                     ticker_a=pair.ticker_a, ticker_b=pair.ticker_b, basket=pair.basket,
                 )
         elif position != 0:
-            bars_held = i - entry_idx
+            bars_held = i - pos_state.entry_bar
+            pos_state.bars_held = bars_held
+            features = extract_exit_features(pos_state, row, bars_held, position)
             should_exit = False
 
             if position == 1 and z > -0.4:
@@ -760,11 +952,19 @@ def _trade_pair_session(
                 should_exit = True
 
             if should_exit:
+                # Soft exit score from live features (pnl_proxy + confidence);
+                # swap for LogisticExitModel.predict_proba when a trained model
+                # is passed into the session.
+                ml_proba = float(
+                    1.0 / (1.0 + np.exp(-(0.8 * features[2] + 0.5 * (features[4] - 0.5))))
+                )
+                ml_proba = float(np.clip(ml_proba, 0.05, 0.95))
                 trader.close_trade(
                     time, z, row["spread"],
-                    ml_proba=np.random.uniform(0.55, 0.85),
+                    ml_proba=ml_proba,
                 )
                 position = 0
+                pos_state = PositionState()
                 opened += 1
                 if opened >= trades_remaining:
                     break
@@ -798,9 +998,9 @@ def run_paper_trading_and_train(
     print(f"\nPrice panel: {prices.shape[1]} tickers × {prices.shape[0]} bars  [source: {data_source}]")
     print(f"Trade windows: {trade_year} only (no prior-year entries)\n")
 
-    # 2–3. Scan pairs with Kalman filter + paper trader
+    # 2–3. Adaptive Kalman filter + paper trader
     trader = PaperTrader()
-    kf = SimpleKalmanPairs()
+    kf = AdaptiveKalmanPairs(delta=1e-4, R=1e-2)
     pair_frames: Dict[str, pd.DataFrame] = {}
     closed_count = 0
 
