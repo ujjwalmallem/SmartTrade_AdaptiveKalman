@@ -897,11 +897,11 @@ def get_exit_model_version(model: Optional["LogisticExitModel"] = None) -> str:
 
 def save_setups(
     setups: List[Setup],
-    results_dir: Path = RESULTS_DIR,
+    results_dir: Optional[Path] = None,
     run_id: str = "",
 ) -> Path:
     """Write setups_*.csv only — never touches paper_trades / training dataset."""
-    results_dir = Path(results_dir)
+    results_dir = Path(results_dir) if results_dir is not None else RESULTS_DIR
     results_dir.mkdir(parents=True, exist_ok=True)
     run_id = run_id or pd.Timestamp.now("UTC").strftime("%Y%m%dT%H%M%SZ")
     path = results_dir / f"setups_{run_id}.csv"
@@ -1141,7 +1141,7 @@ def run_research_setups(
         print(f"   setups: {len(pair_setups)}")
         all_setups.extend(pair_setups)
 
-    path = save_setups(all_setups, run_id=run_id)
+    path = save_setups(all_setups, results_dir=RESULTS_DIR, run_id=run_id)
     if all_setups:
         labels = [s.label for s in all_setups if s.label is not None]
         pnls = [s.pnl_z for s in all_setups if s.pnl_z is not None]
