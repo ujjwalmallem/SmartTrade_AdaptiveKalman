@@ -10,7 +10,7 @@ python paper_trading_ml_exit.py
 python paper_trading_ml_exit.py --train-only   # retrain from results/
 ```
 
-**Data:** prices are fetched from **yfinance only**. There is no synthetic fallback — if the download fails, the run errors out (required for clean training labels).
+**Data:** prices from **yfinance only** (no synthetic). Trade windows and training samples are restricted to the **latest calendar year** (e.g. 2026) — prior years like 2025 are excluded.
 
 Artifacts land in `results/` (gitignored):
 - `paper_trades.csv`
