@@ -768,7 +768,7 @@ def save_paper_results(
     """
     results_dir = Path(results_dir) if results_dir is not None else RESULTS_DIR
     results_dir.mkdir(parents=True, exist_ok=True)
-    run_id = run_id or pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    run_id = run_id or pd.Timestamp.now("UTC").strftime("%Y%m%dT%H%M%SZ")
     year = _latest_allowed_trade_year()
 
     frame = closed_trades_to_frame(closed_trades, run_id=run_id, data_source=data_source)
@@ -805,7 +805,7 @@ def save_paper_results(
 
 def _latest_allowed_trade_year(now: Optional[pd.Timestamp] = None) -> int:
     """Calendar year used for training/trade windows (never prior years)."""
-    return int(pd.Timestamp(now or pd.Timestamp.utcnow()).year)
+    return int(pd.Timestamp(now or pd.Timestamp.now("UTC")).year)
 
 
 def filter_trades_to_latest_year(
