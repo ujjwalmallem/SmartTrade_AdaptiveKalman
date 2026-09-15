@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -87,6 +88,43 @@ class TestExitFeatures(unittest.TestCase):
         feat = m.trade_to_features(trade)
         self.assertEqual(len(feat), len(m.FEATURE_NAMES))
         self.assertTrue(np.isfinite(feat).all())
+
+    def test_trade_to_features_prefers_stored_exit_features(self):
+        live = np.arange(len(m.FEATURE_NAMES), dtype=float) + 0.25
+        trade = m.PaperTrade(
+            trade_id=2,
+            direction="SHORT_SPREAD",
+            entry_time=pd.Timestamp("2026-04-01"),
+            entry_z=2.1,
+            entry_spread=1.0,
+            exit_time=pd.Timestamp("2026-04-05"),
+            exit_z=0.4,
+            bars_held=4,
+            pnl_z=1.7,
+            status="CLOSED",
+            exit_features=live,
+        )
+        feat = m.trade_to_features(trade)
+        np.testing.assert_allclose(feat, live)
+
+    def test_close_trade_stores_exit_features_and_frame_json(self):
+        trader = m.PaperTrader()
+        trader.open_trade(1, pd.Timestamp("2026-05-01"), -2.0, 1.0, "AAPL", "MSFT", "mag7")
+        live = np.linspace(0.1, 1.0, len(m.FEATURE_NAMES))
+        trader.close_trade(
+            pd.Timestamp("2026-05-05"), -0.4, 0.8,
+            ml_proba=0.77, features=live,
+        )
+        t = trader.trades[0]
+        self.assertIsNotNone(t.exit_features)
+        np.testing.assert_allclose(t.exit_features, live)
+        frame = m.closed_trades_to_frame([t], run_id="test", data_source="yfinance_live")
+        self.assertIn("exit_features_json", frame.columns)
+        parsed = json.loads(frame.loc[0, "exit_features_json"])
+        np.testing.assert_allclose(parsed, live)
+        # feat_* columns come from exact vector
+        for i, name in enumerate(m.FEATURE_NAMES):
+            self.assertAlmostEqual(frame.loc[0, f"feat_{name}"], live[i])
 
 
 class TestShouldExitWithML(unittest.TestCase):

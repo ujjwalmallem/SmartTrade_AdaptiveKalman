@@ -554,27 +554,31 @@ def extract_exit_features(
 
 def trade_to_features(t: "PaperTrade") -> np.ndarray:
     """
-    Reconstruct a reasonable feature vector from a closed PaperTrade
-    (used when training from the journal). Some path-dependent fields
-    are approximated because the full intra-trade series is not stored.
+    Prefer the exact live feature vector stored at exit.
+    Fall back to a reconstructed approximation only if missing
+    (e.g. legacy journal rows).
     """
+    if t.exit_features is not None and len(t.exit_features) == len(FEATURE_NAMES):
+        return np.asarray(t.exit_features, dtype=float)
+
+    # ---------- fallback reconstruction (legacy) ----------
     pnl = t.pnl_z
     bars_norm = t.bars_held / 30.0
     exit_z = t.exit_z if t.exit_z is not None else 0.0
-    fav = max(0.0, pnl)                 # realized favorable excursion proxy
-    best_fav = max(abs(t.entry_z), fav) # crude upper bound
+    fav = max(0.0, pnl)
+    best_fav = max(abs(t.entry_z), fav)
 
     return np.array([
         t.entry_z,
         abs(t.entry_z),
         pnl,
         bars_norm,
-        0.70,               # confidence placeholder (could be stored later)
-        0.0,                # velocity unknown from journal
+        0.70,
+        0.0,
         exit_z,
         fav,
         best_fav,
-        1.0,                # vol placeholder
+        1.0,
     ], dtype=float)
 
 
@@ -588,7 +592,7 @@ def closed_trades_to_frame(
 ) -> pd.DataFrame:
     rows = []
     for t in closed_trades:
-        feat = trade_to_features(t)
+        feat = trade_to_features(t)          # prefers exact live vector
         row = {
             "run_id": run_id,
             "data_source": data_source,
@@ -607,6 +611,10 @@ def closed_trades_to_frame(
             "pnl_z": t.pnl_z,
             "ml_proba_at_exit": t.ml_proba_at_exit,
             "label": trade_to_label(t),
+            "exit_features_json": (
+                json.dumps(np.asarray(t.exit_features, dtype=float).tolist())
+                if t.exit_features is not None else None
+            ),
         }
         for name, val in zip(FEATURE_NAMES, feat):
             row[f"feat_{name}"] = val
@@ -792,6 +800,8 @@ class PaperTrade:
     pnl_z: float = 0.0
     status: str = "OPEN"
     ml_proba_at_exit: float = None
+    # Exact feature vector at exit time (from extract_exit_features)
+    exit_features: Optional[np.ndarray] = None
 
 class PaperTrader:
     def __init__(self, capital=100_000):
@@ -820,10 +830,10 @@ class PaperTrader:
         print(f"\n🟢 OPENED Trade #{trade.trade_id} | {side} | {pair} [{basket}]")
         print(f"   Time: {time.date()} | z={z:.2f} | spread={spread:.3f}")
     
-    def close_trade(self, time, z, spread, ml_proba=None):
+    def close_trade(self, time, z, spread, ml_proba=None, features: Optional[np.ndarray] = None):
         if self.current_trade is None:
             return
-        
+
         t = self.current_trade
         t.exit_time = time
         t.exit_z = z
@@ -831,18 +841,19 @@ class PaperTrader:
         t.bars_held = (time - t.entry_time).days
         t.ml_proba_at_exit = ml_proba
         t.status = "CLOSED"
-        
+        t.exit_features = features.copy() if features is not None else None
+
         if t.direction == "LONG_SPREAD":
             t.pnl_z = z - t.entry_z
         else:
             t.pnl_z = t.entry_z - z
-        
+
         pair = f"{t.ticker_a}/{t.ticker_b}" if t.ticker_a and t.ticker_b else "PAIR"
         print(f"🔴 CLOSED Trade #{t.trade_id} | {t.direction} | {pair}")
         print(f"   Time: {time.date()} | z={z:.2f} | PnL(z)={t.pnl_z:+.3f} | Bars={t.bars_held}")
         if ml_proba is not None:
             print(f"   ML Exit Prob at close: {ml_proba:.2%}")
-        
+
         self.current_trade = None
     
     def summary(self):
@@ -1005,6 +1016,7 @@ def _trade_pair_session(
                 trader.close_trade(
                     time, z, row["spread"],
                     ml_proba=ml_proba,
+                    features=features,
                 )
                 position = 0
                 pos_state = PositionState()
