@@ -197,76 +197,23 @@ class PositionState:
     current_size: float = 0.0
     bars_held: int = 0
 
-def generate_synthetic_pair(n=800, seed=42, name_a="A", name_b="B"):
-    np.random.seed(seed)
-    t = np.arange(n)
-    true_beta = 1.15 + 0.12 * np.sin(t / 50)
-    returns_b = np.random.normal(0.0002, 0.012, n)
-    price_b = 100 * np.exp(np.cumsum(returns_b))
-    residual = np.zeros(n)
-    for i in range(1, n):
-        residual[i] = 0.90 * residual[i-1] + np.random.normal(0, 0.7)
-    price_a = true_beta * price_b + residual + np.random.normal(0, 0.4, n)
-    idx = pd.date_range("2024-01-01", periods=n, freq="B")
-    return (
-        pd.Series(price_a, index=idx, name=name_a),
-        pd.Series(price_b, index=idx, name=name_b),
-    )
-
-
-def generate_synthetic_prices_for_universe(
-    tickers: Sequence[str],
-    n: int = 800,
-    seed: int = 42,
-) -> pd.DataFrame:
-    """
-    Correlated synthetic prices for universe tickers.
-    Shared market + basket factors make within-basket pairs more cointegrated.
-    """
-    rng = np.random.default_rng(seed)
-    idx = pd.date_range("2024-01-01", periods=n, freq="B")
-    market = rng.normal(0.00025, 0.01, n)
-
-    basket_factors = {
-        name: rng.normal(0.0001, 0.008, n) for name in TICKER_UNIVERSES
-    }
-    # Stable per-ticker seed offsets so pair generation is reproducible
-    ticker_list = list(tickers)
-    prices = {}
-    for i, ticker in enumerate(ticker_list):
-        baskets = ticker_baskets(ticker)
-        factor = np.zeros(n)
-        for b in baskets:
-            factor += basket_factors[b] / max(len(baskets), 1)
-        if not baskets:
-            factor = rng.normal(0.0, 0.006, n)
-        idio = rng.normal(0.00005, 0.012, n)
-        # Slightly different loadings by ticker index
-        beta_mkt = 0.85 + 0.05 * (i % 5)
-        rets = beta_mkt * market + factor + idio
-        # AR(1) residual overlay for mean-reverting relative value
-        resid = np.zeros(n)
-        for t in range(1, n):
-            resid[t] = 0.88 * resid[t - 1] + rng.normal(0, 0.004)
-        level = 80 + 15 * (i % 7)
-        prices[ticker] = level * np.exp(np.cumsum(rets + resid))
-    return pd.DataFrame(prices, index=idx)
-
-
 def fetch_real_prices_for_universe(
     tickers: Sequence[str],
     n_bars: int = 700,
     period: str = "3y",
+    min_bars: int = 100,
 ) -> pd.DataFrame:
     """
-    Real daily close prices for the given tickers via yfinance, aligned on a
-    shared trading-day index (only days every ticker has a price for).
-    Returns the most recent `n_bars` rows. Raises on any fetch/shape problem
-    so the caller can decide how to handle it (see _load_prices_for_universe).
+    Real daily close prices via yfinance only (no synthetic data).
+
+    Aligns tickers on shared trading days, drops names with no usable closes,
+    and returns the most recent `n_bars` rows. Raises if the fetch fails or
+    yields too little history — training must not silently invent prices.
     """
     import yfinance as yf
 
     tickers = list(dict.fromkeys(tickers))  # de-dup, preserve order
+    print(f"Fetching yfinance daily closes for {len(tickers)} tickers (period={period})...")
     raw = yf.download(
         tickers=tickers,
         period=period,
@@ -285,46 +232,46 @@ def fetch_real_prices_for_universe(
             series = raw[t]["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw["Close"]
         except KeyError:
             continue
-        series = series.dropna()
-        if len(series) > 0:
-            closes[t] = series
+        series = pd.to_numeric(series, errors="coerce").dropna()
+        if len(series) >= min_bars:
+            closes[t] = series.rename(t)
 
     missing = [t for t in tickers if t not in closes]
     if missing:
-        print(f"⚠️  No usable close prices from yfinance for: {', '.join(missing)}")
-    if not closes:
-        raise RuntimeError("yfinance returned no usable close prices for any ticker")
+        print(f"⚠️  Dropping tickers with no usable yfinance history: {', '.join(missing)}")
+    if len(closes) < 2:
+        raise RuntimeError(
+            "yfinance returned usable closes for fewer than 2 tickers; "
+            "cannot build pairs for training"
+        )
 
+    # Align on intersection of trading days across surviving tickers, then
+    # keep the most recent window. Pair scans skip any ticker not present.
     prices = pd.DataFrame(closes).dropna(how="any")
-    if prices.empty:
-        raise RuntimeError("No overlapping trading days across fetched tickers")
+    if len(prices) < min_bars:
+        raise RuntimeError(
+            f"Only {len(prices)} overlapping yfinance bars (<{min_bars}); "
+            "refusing to train on insufficient real history"
+        )
 
-    return prices.tail(n_bars)
+    prices = prices.tail(n_bars)
+    print(
+        f"yfinance panel ready: {prices.shape[1]} tickers × {prices.shape[0]} bars "
+        f"[{prices.index.min().date()} → {prices.index.max().date()}]"
+    )
+    return prices
 
 
 def _load_prices_for_universe(
     tickers: Sequence[str],
     n_bars: int,
-    mode: str = "auto",
 ) -> Tuple[pd.DataFrame, str]:
     """
-    mode: "live" (fetch real data, raise on failure), "synthetic" (skip live
-    entirely), or "auto" (try live, fall back to synthetic on any failure).
-    Returns (prices, source_label) — source_label is recorded on every trade
-    row so a synthetic-fallback run is visible in the stored results instead
-    of silently looking like live data.
+    Load prices for training. yfinance only — never synthesizes data.
+    Returns (prices, source_label) for the results journal.
     """
-    if mode in ("auto", "live"):
-        try:
-            prices = fetch_real_prices_for_universe(tickers, n_bars=n_bars)
-            if len(prices) < 100:
-                raise RuntimeError(f"only {len(prices)} usable bars (<100)")
-            return prices, "yfinance_live"
-        except Exception as exc:
-            if mode == "live":
-                raise
-            print(f"⚠️  Live data fetch failed ({exc}); falling back to synthetic data.")
-    return generate_synthetic_prices_for_universe(tickers, n=n_bars, seed=42), "synthetic_fallback"
+    prices = fetch_real_prices_for_universe(tickers, n_bars=n_bars)
+    return prices, "yfinance_live"
 
 # Very simplified Kalman for demo (replace with full AdaptiveKalmanPairs)
 class SimpleKalmanPairs:
@@ -508,7 +455,10 @@ def save_paper_results(
     return trades_path, dataset_path
 
 
-def load_training_dataset(dataset_path: Path = DATASET_CSV) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+def load_training_dataset(
+    dataset_path: Path = DATASET_CSV,
+    require_live: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     path = Path(dataset_path)
     if not path.exists():
         raise FileNotFoundError(
@@ -519,6 +469,20 @@ def load_training_dataset(dataset_path: Path = DATASET_CSV) -> Tuple[np.ndarray,
     missing = [c for c in feat_cols + ["label"] if c not in ds.columns]
     if missing:
         raise ValueError(f"Dataset missing columns: {missing}")
+
+    # Training must use real prices only — drop any legacy synthetic rows.
+    if require_live and "data_source" in ds.columns:
+        before = len(ds)
+        ds = ds[ds["data_source"].astype(str).str.startswith("yfinance")].copy()
+        dropped = before - len(ds)
+        if dropped:
+            print(f"⚠️  Dropped {dropped} non-yfinance rows from training dataset")
+        if ds.empty:
+            raise ValueError(
+                "No yfinance rows left in the training dataset. "
+                "Re-run paper trading to collect real-price samples."
+            )
+
     X = ds[feat_cols].to_numpy(dtype=float)
     y = ds["label"].to_numpy(dtype=float)
     return X, y, ds
@@ -530,12 +494,14 @@ def train_from_stored_results(
     reg: float = 0.3,
     min_samples: int = 2,
 ) -> LogisticExitModel:
-    """Load accumulated paper-trade features and fit the exit model."""
-    X, y, ds = load_training_dataset(dataset_path)
+    """Fit the exit model on stored yfinance-backed paper trades only."""
+    X, y, ds = load_training_dataset(dataset_path, require_live=True)
     if len(y) < min_samples:
         raise ValueError(f"Need at least {min_samples} samples; found {len(y)} in {dataset_path}")
 
-    print(f"\nTraining from stored results: {len(y)} samples ({dataset_path})")
+    print(f"\nTraining from stored results: {len(y)} yfinance samples ({dataset_path})")
+    if "data_source" in ds.columns:
+        print(f"  Sources: {sorted(ds['data_source'].dropna().astype(str).unique().tolist())}")
     print(f"  Baskets: {sorted(ds['basket'].dropna().unique().tolist()) if 'basket' in ds else 'n/a'}")
     model = LogisticExitModel()
     model.fit(X, y, reg=reg)
@@ -716,7 +682,6 @@ def run_paper_trading_and_train(
     baskets: Optional[Sequence[str]] = None,
     include_cross: bool = True,
     max_pairs_per_basket: int = 6,
-    data_source_mode: str = "auto",
 ):
     print("Starting Paper Trading Session...")
     print("Goal: Complete at least", min_trades, "round-trip trades\n")
@@ -730,10 +695,9 @@ def run_paper_trading_and_train(
     )
     summarize_universes(pairs)
 
-    # 1. Prices for all tickers in the active universe: real (yfinance) by
-    # default, falling back to synthetic if the fetch fails (mode="auto").
+    # 1. Prices: yfinance only (hard fail — never synthesize for training)
     tickers = all_universe_tickers(baskets)
-    prices, data_source = _load_prices_for_universe(tickers, n_bars, mode=data_source_mode)
+    prices, data_source = _load_prices_for_universe(tickers, n_bars)
     print(f"\nPrice panel: {prices.shape[1]} tickers × {prices.shape[0]} bars  [source: {data_source}]\n")
 
     # 2–3. Scan pairs with Kalman filter + paper trader
@@ -790,16 +754,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--n-bars", type=int, default=700)
     parser.add_argument("--min-trades", type=int, default=4)
-    parser.add_argument(
-        "--data-source",
-        choices=["auto", "live", "synthetic"],
-        default="auto",
-        help=(
-            "auto (default): fetch real prices via yfinance, fall back to "
-            "synthetic on failure. live: require real data, error out if "
-            "the fetch fails. synthetic: skip live data entirely."
-        ),
-    )
     args = parser.parse_args()
 
     if args.train_only:
@@ -811,7 +765,6 @@ if __name__ == "__main__":
             min_trades=args.min_trades,
             baskets=["mag7", "semis", "memory", "hyperscaler"],
             include_cross=True,
-            data_source_mode=args.data_source,
         )
 
         if model is None:
