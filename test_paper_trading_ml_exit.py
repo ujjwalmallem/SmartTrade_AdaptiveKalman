@@ -228,7 +228,7 @@ class TestOHLCVLoader(unittest.TestCase):
         self.assertEqual(source, "yfinance_live")
         self.assertNotIn("close", panels)  # ticker-keyed, not field-keyed
         self.assertIn("AAPL", panels)
-        self.assertIn("Close", panels["AAPL"].columns
+        self.assertIn("Close", panels["AAPL"].columns)
 
 
 class TestLatestYearFilter(unittest.TestCase):
