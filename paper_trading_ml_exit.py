@@ -844,7 +844,7 @@ def closed_trades_to_frame(
 ) -> pd.DataFrame:
     rows = []
     for t in closed_trades:
-        feat = trade_to_features(t)          # prefers exact live vector
+        feat = trade_to_features(t) if t.status == "CLOSED" else None
         row = {
             "run_id": run_id,
             "data_source": data_source,
@@ -869,14 +869,16 @@ def closed_trades_to_frame(
             "qty_b": t.qty_b,
             "alpaca_order_ids": json.dumps(t.alpaca_order_ids or []),
             "ml_proba_at_exit": t.ml_proba_at_exit,
-            "label": trade_to_label(t),
+            "status": t.status,
+            "label": trade_to_label(t) if t.status == "CLOSED" else None,
             "exit_features_json": (
                 json.dumps(np.asarray(t.exit_features, dtype=float).tolist())
                 if t.exit_features is not None else None
             ),
         }
-        for name, val in zip(FEATURE_NAMES, feat):
-            row[f"feat_{name}"] = val
+        if feat is not None:
+            for name, val in zip(FEATURE_NAMES, feat):
+                row[f"feat_{name}"] = val
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -910,9 +912,15 @@ def save_paper_results(
     journal = filter_trades_to_latest_year(journal, trade_year=year)
     journal.to_csv(trades_path, index=False)
 
-    # Training dataset = feature columns + label (append, then align to latest-year journal)
+    # Training dataset = feature columns + label (closed trades only)
     feat_cols = [f"feat_{n}" for n in FEATURE_NAMES]
-    ds = frame[["run_id", "data_source", "trade_id", "ticker_a", "ticker_b", "basket", *feat_cols, "label"]]
+    closed_frame = frame.copy()
+    if "status" in closed_frame.columns:
+        closed_frame = closed_frame[closed_frame["status"].fillna("CLOSED") == "CLOSED"]
+    closed_frame = closed_frame.dropna(subset=["label"]) if "label" in closed_frame.columns else closed_frame
+    ds = closed_frame[["run_id", "data_source", "trade_id", "ticker_a", "ticker_b", "basket", *feat_cols, "label"]]
+    # Drop rows missing any feature (e.g. open broker mirrors)
+    ds = ds.dropna(subset=feat_cols, how="any")
     if dataset_path.exists():
         prev_ds = pd.read_csv(dataset_path)
         ds = pd.concat([prev_ds, ds], ignore_index=True)
@@ -938,13 +946,15 @@ def filter_trades_to_latest_year(
     trades: pd.DataFrame,
     trade_year: Optional[int] = None,
 ) -> pd.DataFrame:
-    """Keep only rows whose entry and exit fall in the latest calendar year."""
+    """Keep only rows whose entry (and exit, if closed) fall in the latest calendar year."""
     if trades.empty:
         return trades
     year = trade_year if trade_year is not None else _latest_allowed_trade_year()
     entry = pd.to_datetime(trades["entry_time"], format="mixed")
-    exit_ = pd.to_datetime(trades["exit_time"], format="mixed")
-    mask = entry.dt.year.eq(year) & exit_.dt.year.eq(year)
+    exit_ = pd.to_datetime(trades["exit_time"], format="mixed", errors="coerce")
+    open_ok = exit_.isna() & entry.dt.year.eq(year)
+    closed_ok = exit_.notna() & entry.dt.year.eq(year) & exit_.dt.year.eq(year)
+    mask = open_ok | closed_ok
     kept = trades.loc[mask].copy()
     dropped = len(trades) - len(kept)
     if dropped:
@@ -1164,6 +1174,11 @@ class PaperTrader:
                     trade.qty_a = float(result.fills[0].qty)
                     trade.qty_b = float(result.fills[1].qty)
             except Exception as exc:
+                msg = str(exc)
+                if "existing Alpaca exposure" in msg or "Skip entry" in msg:
+                    print(f"⚠️  {msg}")
+                    self.trade_counter -= 1
+                    return
                 print(f"⚠️  Alpaca entry failed ({exc}); keeping sim journal fill only")
 
         self.current_trade = trade
@@ -1385,8 +1400,52 @@ def _trade_pair_session(
             if live and not is_latest:
                 continue
 
-            # Classic z-score entry with confidence filter
-            if z < -2.0 and conf > 0.55:
+            # Live idempotency: adopt existing Alpaca pair exposure (exit-only)
+            if live and trader.broker is not None:
+                try:
+                    exp = trader.broker.pair_exposure(pair.ticker_a, pair.ticker_b)
+                except Exception as exc:
+                    print(f"⚠️  Could not read Alpaca exposure for {pair.label}: {exc}")
+                    exp = {"flat": True, "direction": 0, "qty_a": 0.0, "qty_b": 0.0, "blocked": False}
+                if exp.get("blocked"):
+                    print(f"⚠️  Skip {pair.label}: ambiguous open legs on Alpaca")
+                    break
+                if not exp.get("flat") and exp.get("direction") in (1, -1):
+                    position = int(exp["direction"])
+                    entry_idx = max(60, i - 1)
+                    pos_state = PositionState(
+                        direction=position,
+                        entry_z=z,
+                        entry_bar=entry_idx,
+                        entry_spread=float(row["spread"]),
+                        highest_favorable_z=0.0,
+                    )
+                    side = "LONG_SPREAD" if position == 1 else "SHORT_SPREAD"
+                    trader.trade_counter += 1
+                    mirrored = PaperTrade(
+                        trade_id=trader.trade_counter,
+                        direction=side,
+                        entry_time=time,
+                        entry_z=z,
+                        entry_spread=float(row["spread"]),
+                        ticker_a=pair.ticker_a,
+                        ticker_b=pair.ticker_b,
+                        basket=pair.basket,
+                        notional=0.0,
+                        broker=trader.broker.name,
+                        qty_a=float(exp["qty_a"]),
+                        qty_b=float(exp["qty_b"]),
+                        status="OPEN",
+                    )
+                    trader.current_trade = mirrored
+                    trader.trades.append(mirrored)
+                    print(
+                        f"ℹ️  Adopted open Alpaca {side} on {pair.label} "
+                        f"(qty {exp['qty_a']:.0f}/{exp['qty_b']:.0f}) — will not re-enter"
+                    )
+
+            # Classic z-score entry with confidence filter (only if still flat)
+            if position == 0 and z < -2.0 and conf > 0.55:
                 position = 1
                 entry_idx = i
                 pos_state = PositionState(
@@ -1396,6 +1455,7 @@ def _trade_pair_session(
                     entry_spread=float(row["spread"]),
                     highest_favorable_z=0.0,
                 )
+                before_n = len(trader.trades)
                 trader.open_trade(
                     direction=1,
                     time=time,
@@ -1408,8 +1468,10 @@ def _trade_pair_session(
                     price_a=float(row["price_a"]),
                     price_b=float(row["price_b"]),
                 )
+                if len(trader.trades) == before_n:
+                    position = 0  # broker refused (e.g. existing exposure)
 
-            elif z > 2.0 and conf > 0.55:
+            elif position == 0 and z > 2.0 and conf > 0.55:
                 position = -1
                 entry_idx = i
                 pos_state = PositionState(
@@ -1419,6 +1481,7 @@ def _trade_pair_session(
                     entry_spread=float(row["spread"]),
                     highest_favorable_z=0.0,
                 )
+                before_n = len(trader.trades)
                 trader.open_trade(
                     direction=-1,
                     time=time,
@@ -1431,9 +1494,12 @@ def _trade_pair_session(
                     price_a=float(row["price_a"]),
                     price_b=float(row["price_b"]),
                 )
+                if len(trader.trades) == before_n:
+                    position = 0
 
         # ---------- EXIT (rules + ML + half-life) ----------
-        elif position != 0:
+        # Use `if` (not elif) so a just-adopted live position can exit this bar
+        if position != 0:
             # Live mode only manages the position on the latest bar
             if live and not is_latest:
                 continue
@@ -1637,25 +1703,35 @@ def run_paper_trading_and_train(
     closed_trades = [
         t for t in closed_trades
         if int(pd.Timestamp(t.entry_time).year) == trade_year
+        and t.exit_time is not None
         and int(pd.Timestamp(t.exit_time).year) == trade_year
+    ]
+    # Persist still-open Alpaca live entries so the journal matches the brokerage
+    open_broker_trades = [
+        t for t in trader.trades
+        if t.status == "OPEN"
+        and str(getattr(t, "broker", "")).startswith("alpaca")
+        and int(pd.Timestamp(t.entry_time).year) == trade_year
     ]
     # Use last scanned frame for return compatibility; prefer first if empty
     df_out = next(iter(pair_frames.values())) if pair_frames else prices
+
+    to_save = list(closed_trades) + list(open_broker_trades)
 
     if len(closed_trades) < 2:
         if mode == "live":
             print(
                 "Live session: fewer than 2 closed trades (no/insufficient latest-bar signals). "
-                "Broker orders are still placed when a latest-bar entry/exit fires."
+                "Open Alpaca entries are still journaled when placed/adopted."
             )
-            if closed_trades:
-                save_paper_results(closed_trades, data_source=data_source)
+            if to_save:
+                save_paper_results(to_save, data_source=data_source)
             return trader, None, df_out
         print("Not enough trades generated. Try increasing n_bars or relaxing entry thresholds.")
         return trader, None, df_out
 
     # 5. Persist results, then train (from this run + any prior stored history)
-    save_paper_results(closed_trades, data_source=data_source)
+    save_paper_results(to_save, data_source=data_source)
     print("\nTraining ML Exit Model on stored paper trades...")
     model = train_from_stored_results()
 

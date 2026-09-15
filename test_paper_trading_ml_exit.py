@@ -358,6 +358,36 @@ class TestEndToEndYfinance(unittest.TestCase):
 
 
 class TestLiveMode(unittest.TestCase):
+
+    def test_live_skips_reentry_when_alpaca_exposed(self):
+        from alpaca_paper_broker import AlpacaPaperBroker
+        br = AlpacaPaperBroker(paper=True, dry_run=True)
+        br.pair_exposure = lambda a, b: {
+            "flat": False, "direction": -1, "qty_a": 21.0, "qty_b": 11.0, "blocked": False,
+        }
+        calls = {"n": 0}
+        real = br.open_pair
+        def wrapped(*a, **k):
+            calls["n"] += 1
+            return real(*a, **k)
+        br.open_pair = wrapped
+
+        idx = pd.date_range("2026-01-02", periods=80, freq="B")
+        z = np.zeros(len(idx)); z[-1] = 2.5
+        df = pd.DataFrame({
+            "zscore": z, "confidence": np.full(len(idx), 0.7), "spread": 0.0,
+            "spread_velocity": 0.0, "spread_vol": 1.0,
+            "price_a": 180.0, "price_b": 340.0,
+        }, index=idx)
+        pair = m.PairSpec(ticker_a="QCOM", ticker_b="AVGO", basket="semis")
+        trader = m.PaperTrader(broker=br, execute_latest_only=True, latest_bar=idx[-1])
+        m._trade_pair_session(
+            trader, df, pair, min_trades=1, trades_remaining=1,
+            trade_year=2026, mode="live", latest_bar=idx[-1],
+        )
+        self.assertEqual(calls["n"], 0)
+        self.assertTrue(any(tr.status == "OPEN" and tr.broker == "alpaca_paper" for tr in trader.trades))
+
     def test_live_mode_only_enters_on_latest_bar(self):
         idx = pd.date_range("2026-01-02", periods=120, freq="B")
         rng = np.random.default_rng(0)

@@ -138,7 +138,14 @@ class AlpacaPaperBroker:
         """
         Submit both legs of a pairs entry to Alpaca paper.
         direction: LONG_SPREAD | SHORT_SPREAD
+        Refuses to open if either leg already has an open position.
         """
+        exp = self.pair_exposure(ticker_a, ticker_b)
+        if not exp["flat"] or exp["blocked"]:
+            raise RuntimeError(
+                f"Skip entry {ticker_a}/{ticker_b}: existing Alpaca exposure "
+                f"(qty_a={exp['qty_a']}, qty_b={exp['qty_b']}, blocked={exp['blocked']})"
+            )
         leg = float(notional) / 2.0
         qty_a = self._qty_for_leg(leg, float(price_a))
         qty_b = self._qty_for_leg(leg, float(price_b))
@@ -233,6 +240,48 @@ class AlpacaPaperBroker:
         if self.dry_run:
             return []
         return list(self._client.get_all_positions())
+
+    def position_signed_qty(self, symbol: str) -> float:
+        """Positive = long, negative = short, 0 = flat."""
+        if self.dry_run:
+            return 0.0
+        try:
+            pos = self._client.get_open_position(symbol)
+            qty = float(getattr(pos, "qty", 0) or 0)
+            side = str(getattr(pos, "side", "")).lower()
+            if side == "short" or qty < 0:
+                return -abs(qty)
+            return abs(qty)
+        except Exception:
+            return 0.0
+
+    def pair_exposure(self, ticker_a: str, ticker_b: str) -> dict:
+        """
+        Infer whether a pairs position is already open on Alpaca.
+
+        Returns keys:
+          flat | direction (1/-1) | qty_a | qty_b | blocked (ambiguous legs)
+        """
+        qa = self.position_signed_qty(ticker_a)
+        qb = self.position_signed_qty(ticker_b)
+        if qa == 0.0 and qb == 0.0:
+            return {"flat": True, "direction": 0, "qty_a": 0.0, "qty_b": 0.0, "blocked": False}
+        # LONG_SPREAD: +A / -B ; SHORT_SPREAD: -A / +B
+        if qa > 0 and qb < 0:
+            return {"flat": False, "direction": 1, "qty_a": abs(qa), "qty_b": abs(qb), "blocked": False}
+        if qa < 0 and qb > 0:
+            return {"flat": False, "direction": -1, "qty_a": abs(qa), "qty_b": abs(qb), "blocked": False}
+        return {
+            "flat": False,
+            "direction": 0,
+            "qty_a": abs(qa),
+            "qty_b": abs(qb),
+            "blocked": True,
+        }
+
+    def legs_are_busy(self, ticker_a: str, ticker_b: str) -> bool:
+        exp = self.pair_exposure(ticker_a, ticker_b)
+        return (not exp["flat"]) or exp["blocked"]
 
 
 def _period_to_start(period: str) -> datetime:

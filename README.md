@@ -22,7 +22,9 @@ python paper_trading_ml_exit.py --train-only
 2. Add exactly these names (paper keys only — never live keys):
    - `ALPACA_API_KEY`
    - `ALPACA_API_SECRET_KEY`
-3. CI (with GitHub Secrets) runs two steps when Alpaca keys exist:
+3. Live mode is **idempotent**: if QCOM/AVGO (or any pair) is already open on Alpaca, the next run adopts it for exit management and will **not** stack duplicate entries.
+
+CI (with GitHub Secrets) runs two steps when Alpaca keys exist:
    1. `--mode backtest --broker sim` → builds the ML journal from history
    2. `--mode live --broker alpaca` → places paper orders only if today's latest bar has a signal
 
