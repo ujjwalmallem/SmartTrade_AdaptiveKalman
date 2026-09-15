@@ -138,7 +138,14 @@ class AlpacaPaperBroker:
         """
         Submit both legs of a pairs entry to Alpaca paper.
         direction: LONG_SPREAD | SHORT_SPREAD
+        Refuses to open if either leg already has an open position.
         """
+        exp = self.pair_exposure(ticker_a, ticker_b)
+        if not exp["flat"] or exp["blocked"]:
+            raise RuntimeError(
+                f"Skip entry {ticker_a}/{ticker_b}: existing Alpaca exposure "
+                f"(qty_a={exp['qty_a']}, qty_b={exp['qty_b']}, blocked={exp['blocked']})"
+            )
         leg = float(notional) / 2.0
         qty_a = self._qty_for_leg(leg, float(price_a))
         qty_b = self._qty_for_leg(leg, float(price_b))
@@ -178,6 +185,46 @@ class AlpacaPaperBroker:
         )
         return result
 
+    def cancel_open_orders(self, *symbols: str) -> int:
+        """Cancel open orders for the given symbols (avoids wash-trade blocks)."""
+        if self.dry_run or self._client is None:
+            return 0
+        cancelled = 0
+        want = {s.upper() for s in symbols if s}
+        try:
+            orders = list(self._client.get_orders(status="open") or [])
+        except TypeError:
+            # Older alpaca-py: GetOrdersRequest
+            try:
+                from alpaca.trading.requests import GetOrdersRequest
+                from alpaca.trading.enums import QueryOrderStatus
+
+                orders = list(
+                    self._client.get_orders(
+                        filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)
+                    )
+                    or []
+                )
+            except Exception as exc:
+                print(f"⚠️  Alpaca list open orders failed: {exc}")
+                return 0
+        except Exception as exc:
+            print(f"⚠️  Alpaca list open orders failed: {exc}")
+            return 0
+        for order in orders:
+            sym = str(getattr(order, "symbol", "") or "").upper()
+            if want and sym not in want:
+                continue
+            oid = getattr(order, "id", None)
+            if not oid:
+                continue
+            try:
+                self._client.cancel_order_by_id(oid)
+                cancelled += 1
+            except Exception as exc:
+                print(f"⚠️  Alpaca cancel {sym} order {oid} failed: {exc}")
+        return cancelled
+
     def close_pair(
         self,
         ticker_a: str,
@@ -188,7 +235,13 @@ class AlpacaPaperBroker:
     ) -> PairOrderResult:
         """
         Flatten both legs (reverse of entry). Falls back to close_position when qty unknown.
+        Raises RuntimeError if either leg fails (so the journal can stay OPEN).
         """
+        # Pending entry orders of the opposite side trigger Alpaca wash-trade rejects.
+        n_cancel = self.cancel_open_orders(ticker_a, ticker_b)
+        if n_cancel:
+            print(f"   🏦 Cancelled {n_cancel} open order(s) before exit")
+
         if direction == "LONG_SPREAD":
             # entry was buy A / sell B → exit sell A / buy B
             side_a, side_b = "sell", "buy"
@@ -196,6 +249,7 @@ class AlpacaPaperBroker:
             side_a, side_b = "buy", "sell"
 
         result = PairOrderResult(direction=direction)
+        failures: List[str] = []
         for symbol, qty, side in (
             (ticker_a, qty_a, side_a),
             (ticker_b, qty_b, side_b),
@@ -224,7 +278,14 @@ class AlpacaPaperBroker:
                 )
                 result.raw_orders.append(order)
             except Exception as exc:
-                print(f"⚠️  Alpaca close {symbol} failed: {exc}")
+                msg = f"{symbol}: {exc}"
+                print(f"⚠️  Alpaca close {msg}")
+                failures.append(msg)
+
+        if failures:
+            raise RuntimeError(
+                f"Alpaca exit incomplete for {ticker_a}/{ticker_b}: " + "; ".join(failures)
+            )
 
         print(f"   🏦 Alpaca paper exit flattened {ticker_a}/{ticker_b}")
         return result
@@ -233,6 +294,48 @@ class AlpacaPaperBroker:
         if self.dry_run:
             return []
         return list(self._client.get_all_positions())
+
+    def position_signed_qty(self, symbol: str) -> float:
+        """Positive = long, negative = short, 0 = flat."""
+        if self.dry_run:
+            return 0.0
+        try:
+            pos = self._client.get_open_position(symbol)
+            qty = float(getattr(pos, "qty", 0) or 0)
+            side = str(getattr(pos, "side", "")).lower()
+            if side == "short" or qty < 0:
+                return -abs(qty)
+            return abs(qty)
+        except Exception:
+            return 0.0
+
+    def pair_exposure(self, ticker_a: str, ticker_b: str) -> dict:
+        """
+        Infer whether a pairs position is already open on Alpaca.
+
+        Returns keys:
+          flat | direction (1/-1) | qty_a | qty_b | blocked (ambiguous legs)
+        """
+        qa = self.position_signed_qty(ticker_a)
+        qb = self.position_signed_qty(ticker_b)
+        if qa == 0.0 and qb == 0.0:
+            return {"flat": True, "direction": 0, "qty_a": 0.0, "qty_b": 0.0, "blocked": False}
+        # LONG_SPREAD: +A / -B ; SHORT_SPREAD: -A / +B
+        if qa > 0 and qb < 0:
+            return {"flat": False, "direction": 1, "qty_a": abs(qa), "qty_b": abs(qb), "blocked": False}
+        if qa < 0 and qb > 0:
+            return {"flat": False, "direction": -1, "qty_a": abs(qa), "qty_b": abs(qb), "blocked": False}
+        return {
+            "flat": False,
+            "direction": 0,
+            "qty_a": abs(qa),
+            "qty_b": abs(qb),
+            "blocked": True,
+        }
+
+    def legs_are_busy(self, ticker_a: str, ticker_b: str) -> bool:
+        exp = self.pair_exposure(ticker_a, ticker_b)
+        return (not exp["flat"]) or exp["blocked"]
 
 
 def _period_to_start(period: str) -> datetime:

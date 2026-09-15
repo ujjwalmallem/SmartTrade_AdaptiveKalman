@@ -358,6 +358,36 @@ class TestEndToEndYfinance(unittest.TestCase):
 
 
 class TestLiveMode(unittest.TestCase):
+
+    def test_live_skips_reentry_when_alpaca_exposed(self):
+        from alpaca_paper_broker import AlpacaPaperBroker
+        br = AlpacaPaperBroker(paper=True, dry_run=True)
+        br.pair_exposure = lambda a, b: {
+            "flat": False, "direction": -1, "qty_a": 21.0, "qty_b": 11.0, "blocked": False,
+        }
+        calls = {"n": 0}
+        real = br.open_pair
+        def wrapped(*a, **k):
+            calls["n"] += 1
+            return real(*a, **k)
+        br.open_pair = wrapped
+
+        idx = pd.date_range("2026-01-02", periods=80, freq="B")
+        z = np.zeros(len(idx)); z[-1] = 2.5
+        df = pd.DataFrame({
+            "zscore": z, "confidence": np.full(len(idx), 0.7), "spread": 0.0,
+            "spread_velocity": 0.0, "spread_vol": 1.0,
+            "price_a": 180.0, "price_b": 340.0,
+        }, index=idx)
+        pair = m.PairSpec(ticker_a="QCOM", ticker_b="AVGO", basket="semis")
+        trader = m.PaperTrader(broker=br, execute_latest_only=True, latest_bar=idx[-1])
+        m._trade_pair_session(
+            trader, df, pair, min_trades=1, trades_remaining=1,
+            trade_year=2026, mode="live", latest_bar=idx[-1],
+        )
+        self.assertEqual(calls["n"], 0)
+        self.assertTrue(any(tr.status == "OPEN" and tr.broker == "alpaca_paper" for tr in trader.trades))
+
     def test_live_mode_only_enters_on_latest_bar(self):
         idx = pd.date_range("2026-01-02", periods=120, freq="B")
         rng = np.random.default_rng(0)
@@ -382,6 +412,105 @@ class TestLiveMode(unittest.TestCase):
         self.assertGreaterEqual(len(trader.trades), 1)
         for tr in trader.trades:
             self.assertEqual(pd.Timestamp(tr.entry_time).normalize(), pd.Timestamp(idx[-1]).normalize())
+
+    def test_live_holds_overnight_no_same_bar_exit(self):
+        from alpaca_paper_broker import AlpacaPaperBroker
+        br = AlpacaPaperBroker(paper=True, dry_run=True)
+        br.pair_exposure = lambda a, b: {
+            "flat": True, "direction": 0, "qty_a": 0.0, "qty_b": 0.0, "blocked": False,
+        }
+        idx = pd.date_range("2026-01-02", periods=80, freq="B")
+        # Extreme z that would normally force an immediate ML/rule exit
+        z = np.zeros(len(idx))
+        z[-1] = 2.5
+        df = pd.DataFrame({
+            "zscore": z, "confidence": np.full(len(idx), 0.7), "spread": 0.0,
+            "spread_velocity": 0.0, "spread_vol": 1.0,
+            "price_a": 180.0, "price_b": 340.0,
+        }, index=idx)
+        pair = m.PairSpec(ticker_a="QCOM", ticker_b="AVGO", basket="semis")
+        trader = m.PaperTrader(broker=br, execute_latest_only=True, latest_bar=idx[-1])
+        m._trade_pair_session(
+            trader, df, pair, min_trades=1, trades_remaining=1,
+            trade_year=2026, mode="live", latest_bar=idx[-1],
+        )
+        self.assertEqual(len(trader.trades), 1)
+        self.assertEqual(trader.trades[0].status, "OPEN")
+        self.assertEqual(trader.trades[0].broker, "alpaca_paper")
+        self.assertIsNone(trader.trades[0].exit_time)
+
+    def test_failed_alpaca_exit_keeps_trade_open(self):
+        from alpaca_paper_broker import AlpacaPaperBroker
+        br = AlpacaPaperBroker(paper=True, dry_run=True)
+
+        def boom(*a, **k):
+            raise RuntimeError("wash trade detected")
+
+        br.close_pair = boom
+        trader = m.PaperTrader(broker=br, execute_latest_only=True, latest_bar=pd.Timestamp("2026-09-15"))
+        trader.open_trade(
+            -1, pd.Timestamp("2026-09-15"), 2.2, 1.0,
+            "QCOM", "AVGO", "semis", price_a=180, price_b=340,
+        )
+        self.assertEqual(trader.trades[0].status, "OPEN")
+        ok = trader.close_trade(pd.Timestamp("2026-09-15"), 0.1, 0.5, bars_held=2)
+        self.assertFalse(ok)
+        self.assertEqual(trader.trades[0].status, "OPEN")
+        self.assertIsNone(trader.trades[0].exit_time)
+
+    def test_dedupe_sim_journal_keeps_alpaca(self):
+        df = pd.DataFrame([
+            {
+                "run_id": "a", "trade_id": 1, "ticker_a": "AAPL", "ticker_b": "MSFT",
+                "direction": "LONG_SPREAD", "entry_time": "2026-04-13", "exit_time": "2026-04-17",
+                "broker": "sim",
+            },
+            {
+                "run_id": "b", "trade_id": 1, "ticker_a": "AAPL", "ticker_b": "MSFT",
+                "direction": "LONG_SPREAD", "entry_time": "2026-04-13", "exit_time": "2026-04-17",
+                "broker": "sim",
+            },
+            {
+                "run_id": "c", "trade_id": 1, "ticker_a": "QCOM", "ticker_b": "AVGO",
+                "direction": "SHORT_SPREAD", "entry_time": "2026-09-15", "exit_time": None,
+                "broker": "alpaca_paper",
+            },
+            {
+                "run_id": "d", "trade_id": 2, "ticker_a": "QCOM", "ticker_b": "AVGO",
+                "direction": "SHORT_SPREAD", "entry_time": "2026-09-15", "exit_time": None,
+                "broker": "alpaca_paper",
+            },
+        ])
+        out = m.dedupe_journal_rows(df)
+        sim_rows = out[out["broker"] == "sim"]
+        alpaca_rows = out[out["broker"] == "alpaca_paper"]
+        self.assertEqual(len(sim_rows), 1)
+        self.assertEqual(len(alpaca_rows), 2)
+
+    def test_save_open_only_trades_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            trade = m.PaperTrade(
+                trade_id=1,
+                direction="SHORT_SPREAD",
+                entry_time=pd.Timestamp("2026-09-15"),
+                entry_z=2.2,
+                entry_spread=1.0,
+                ticker_a="QCOM",
+                ticker_b="AVGO",
+                basket="semis",
+                broker="alpaca_paper",
+                qty_a=21.0,
+                qty_b=11.0,
+                status="OPEN",
+            )
+            path, ds_path = m.save_paper_results([trade], results_dir=tmp_path, data_source="alpaca_live")
+            journal = pd.read_csv(path)
+            self.assertEqual(len(journal), 1)
+            self.assertEqual(journal.iloc[0]["status"], "OPEN")
+            self.assertEqual(journal.iloc[0]["broker"], "alpaca_paper")
+            self.assertTrue(ds_path.exists())
+            self.assertEqual(len(pd.read_csv(ds_path)), 0)
 
 class TestAlpacaDataPrimary(unittest.TestCase):
     def test_alpaca_primary_path_with_mock(self):
