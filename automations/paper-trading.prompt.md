@@ -6,9 +6,15 @@ You are running a scheduled paper-trading session for Mag7, semis, memory, and h
 
 1. Confirm you are on the latest `main` (or the automation’s configured branch).
 2. Install deps if needed: `pip install -r requirements.txt`
-3. Run the trainer (yfinance only — no synthetic prices):
+3. Run the trainer (yfinance only — no synthetic prices).
+   Default broker is local sim. To place **Alpaca paper** orders on the latest bar only
+   (requires `ALPACA_API_KEY` + `ALPACA_API_SECRET_KEY` secrets):
    ```bash
-   python paper_trading_ml_exit.py
+   python paper_trading_ml_exit.py --broker alpaca
+   ```
+   Or keep the local journal simulator:
+   ```bash
+   python paper_trading_ml_exit.py --broker sim
    ```
 4. Verify artifacts exist under `results/`:
    - `paper_trades.csv`
