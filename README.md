@@ -7,10 +7,17 @@ Paper trading + ML exit trainer for **Mag7 / semis / memory / hyperscaler** pair
 ```bash
 pip install -r requirements.txt
 python paper_trading_ml_exit.py
+python paper_trading_ml_exit.py --noise-model volume      # volume-adjusted R
+python paper_trading_ml_exit.py --noise-model parkinson   # Parkinson high-low R
 python paper_trading_ml_exit.py --train-only   # retrain from results/
 ```
 
-**Data:** prices from **yfinance only** (no synthetic). Trade windows and training samples are restricted to the **latest calendar year** (e.g. 2026) — prior years like 2025 are excluded.
+**Data:** OHLCV from **yfinance only** (no synthetic). Close is always used; High/Low/Volume enable adaptive Kalman R modes. Trade windows and training samples are restricted to the **latest calendar year** (e.g. 2026) — prior years like 2025 are excluded.
+
+**Kalman R modes** (`--noise-model`):
+- `standard` — fixed (price-scale calibrated) measurement noise
+- `volume` — lower R when relative volume is high
+- `parkinson` — higher R when the high–low range is wide
 
 Artifacts land in `results/` (gitignored):
 - `paper_trades.csv`

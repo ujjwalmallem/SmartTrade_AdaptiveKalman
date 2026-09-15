@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field, asdict
+from enum import Enum
 from typing import List, Dict, Iterable, Optional, Sequence, Tuple
 import warnings
 warnings.filterwarnings("ignore")
@@ -196,24 +197,24 @@ class PositionState:
     current_size: float = 0.0
     bars_held: int = 0
 
-def fetch_real_prices_for_universe(
+def fetch_market_panels_for_universe(
     tickers: Sequence[str],
     n_bars: int = 700,
     period: str = "2y",
     min_bars: int = 80,
     trade_year: Optional[int] = None,
-) -> pd.DataFrame:
+) -> Dict[str, pd.DataFrame]:
     """
-    Real daily close prices via yfinance only (no synthetic data).
+    Real OHLCV via yfinance only (no synthetic data).
 
-    Aligns tickers on shared trading days. Keeps enough history for indicator
-    warm-up, but trade windows are restricted to `trade_year` (default: the
-    calendar year of the latest bar — e.g. 2026, not prior years).
+    Returns dict with keys: close, high, low, volume — each a ticker panel
+    aligned on the same trading days. Trade windows use the latest calendar
+    year; a short prior-year warm-up is kept for indicators.
     """
     import yfinance as yf
 
-    tickers = list(dict.fromkeys(tickers))  # de-dup, preserve order
-    print(f"Fetching yfinance daily closes for {len(tickers)} tickers (period={period})...")
+    tickers = list(dict.fromkeys(tickers))
+    print(f"Fetching yfinance OHLCV for {len(tickers)} tickers (period={period})...")
     raw = yf.download(
         tickers=tickers,
         period=period,
@@ -226,133 +227,236 @@ def fetch_real_prices_for_universe(
     if raw is None or raw.empty:
         raise RuntimeError("yfinance returned no data")
 
-    closes: Dict[str, pd.Series] = {}
+    fields = {"Close": "close", "High": "high", "Low": "low", "Volume": "volume"}
+    series_maps: Dict[str, Dict[str, pd.Series]] = {v: {} for v in fields.values()}
+
     for t in tickers:
         try:
-            series = raw[t]["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw["Close"]
+            if isinstance(raw.columns, pd.MultiIndex):
+                block = raw[t]
+            else:
+                block = raw
         except KeyError:
             continue
-        series = pd.to_numeric(series, errors="coerce").dropna()
-        if len(series) >= min_bars:
-            closes[t] = series.rename(t)
+        try:
+            close = pd.to_numeric(block["Close"], errors="coerce")
+        except KeyError:
+            continue
+        close = close.dropna()
+        if len(close) < min_bars:
+            continue
+        series_maps["close"][t] = close.rename(t)
+        for src, dst in fields.items():
+            if dst == "close":
+                continue
+            if src in block.columns:
+                series_maps[dst][t] = pd.to_numeric(block[src], errors="coerce").rename(t)
+            else:
+                series_maps[dst][t] = pd.Series(np.nan, index=close.index, name=t)
 
-    missing = [t for t in tickers if t not in closes]
+    missing = [t for t in tickers if t not in series_maps["close"]]
     if missing:
         print(f"⚠️  Dropping tickers with no usable yfinance history: {', '.join(missing)}")
-    if len(closes) < 2:
+    if len(series_maps["close"]) < 2:
         raise RuntimeError(
             "yfinance returned usable closes for fewer than 2 tickers; "
             "cannot build pairs for training"
         )
 
-    prices = pd.DataFrame(closes).dropna(how="any")
-    if prices.empty:
+    closes = pd.DataFrame(series_maps["close"]).dropna(how="any")
+    if closes.empty:
         raise RuntimeError("No overlapping trading days across fetched tickers")
 
-    # Prefer a recent window that still leaves warm-up bars before trade_year.
-    prices = prices.tail(max(n_bars, min_bars + 60))
+    # Align other fields to the close index/columns
+    idx = closes.index
+    cols = closes.columns
+    highs = pd.DataFrame(series_maps["high"]).reindex(index=idx, columns=cols)
+    lows = pd.DataFrame(series_maps["low"]).reindex(index=idx, columns=cols)
+    volumes = pd.DataFrame(series_maps["volume"]).reindex(index=idx, columns=cols).fillna(0.0)
 
-    latest_year = int(pd.Timestamp(prices.index.max()).year)
+    # Prefer a recent window that still leaves warm-up bars before trade_year.
+    keep = max(n_bars, min_bars + 60)
+    closes = closes.tail(keep)
+    highs = highs.loc[closes.index]
+    lows = lows.loc[closes.index]
+    volumes = volumes.loc[closes.index]
+
+    latest_year = int(pd.Timestamp(closes.index.max()).year)
     year = int(trade_year) if trade_year is not None else latest_year
     if year != latest_year:
         print(f"⚠️  Requested trade_year={year} but latest bar is {latest_year}; using {latest_year}")
         year = latest_year
 
-    in_year = prices.index.year == year
+    in_year = closes.index.year == year
     if not in_year.any():
         raise RuntimeError(f"No yfinance bars in latest year {year}")
 
-    # Keep prior-year warm-up (for rolling z/confidence) + all latest-year bars.
-    first_trade_i = int(in_year.argmax())  # first True
+    first_trade_i = int(in_year.argmax())
     warm_start = max(0, first_trade_i - 60)
-    prices = prices.iloc[warm_start:]
+    closes = closes.iloc[warm_start:]
+    highs = highs.loc[closes.index]
+    lows = lows.loc[closes.index]
+    volumes = volumes.loc[closes.index]
 
-    trade_bars = int((prices.index.year == year).sum())
+    trade_bars = int((closes.index.year == year).sum())
     if trade_bars < 40:
         raise RuntimeError(
             f"Only {trade_bars} bars in trade year {year}; need more latest-year history"
         )
 
     print(
-        f"yfinance panel ready: {prices.shape[1]} tickers × {prices.shape[0]} bars "
-        f"[{prices.index.min().date()} → {prices.index.max().date()}] "
+        f"yfinance OHLCV ready: {closes.shape[1]} tickers × {closes.shape[0]} bars "
+        f"[{closes.index.min().date()} → {closes.index.max().date()}] "
         f"(trades restricted to {year}: {trade_bars} bars)"
     )
-    prices.attrs["trade_year"] = year
-    return prices
+    closes.attrs["trade_year"] = year
+    return {
+        "close": closes,
+        "high": highs,
+        "low": lows,
+        "volume": volumes,
+    }
+
+
+def fetch_real_prices_for_universe(
+    tickers: Sequence[str],
+    n_bars: int = 700,
+    period: str = "2y",
+    min_bars: int = 80,
+    trade_year: Optional[int] = None,
+) -> pd.DataFrame:
+    """Backward-compatible close-only panel (from OHLCV fetch). """
+    panels = fetch_market_panels_for_universe(
+        tickers, n_bars=n_bars, period=period, min_bars=min_bars, trade_year=trade_year
+    )
+    return panels["close"]
 
 
 def _load_prices_for_universe(
     tickers: Sequence[str],
     n_bars: int,
     trade_year: Optional[int] = None,
-) -> Tuple[pd.DataFrame, str]:
+) -> Tuple[Dict[str, pd.DataFrame], str]:
     """
-    Load prices for training. yfinance only — never synthesizes data.
-    Trade windows use the latest calendar year only.
-    Returns (prices, source_label) for the results journal.
+    Load OHLCV for training. yfinance only — never synthesizes data.
+    Returns (panels_dict, source_label).
     """
-    prices = fetch_real_prices_for_universe(
+    panels = fetch_market_panels_for_universe(
         tickers, n_bars=n_bars, trade_year=trade_year
     )
-    return prices, "yfinance_live"
-
+    return panels, "yfinance_live"
 
 
 # ============================================================
-# ADAPTIVE KALMAN FILTER FOR PAIRS (real implementation)
+# ADAPTIVE KALMAN PAIRS  –  with Zeiierman-style adaptive R
 # ============================================================
+
+class KalmanNoiseModel(str, Enum):
+    STANDARD = "standard"
+    VOLUME = "volume"        # needs volume series
+    PARKINSON = "parkinson"  # needs high & low series
+
 
 @dataclass
 class AdaptiveKalmanPairs:
     """
-    Online Kalman filter estimating time-varying intercept (α) and hedge ratio (β).
-    State: θ = [α, β]
+    Online Kalman filter for pairs: state = [α, β]
     Observation: price_a = α + β * price_b + v
 
-    Adaptive process noise: Q is scaled by recent innovation magnitude so the
-    filter becomes more responsive in volatile regimes and smoother in calm ones.
+    Adaptive features
+    -----------------
+    • Process noise Q is scaled by recent innovation magnitude
+    • Measurement noise R can be:
+        - STANDARD   : fixed (price-scale calibrated)
+        - VOLUME     : shrinks when volume is high (more trust)
+        - PARKINSON  : grows with high-low range (volatility)
     """
-    delta: float = 1e-4          # base process-noise scale
-    R: float = 1e-2              # observation noise variance
-    adapt_window: int = 20      # window for innovation-based adaptation
+    delta: float = 1e-4                 # base process-noise scale
+    R_base: float = 1e-2                # base measurement noise
+    adapt_window: int = 20
     min_conf: float = 0.25
     max_conf: float = 0.95
+    noise_model: KalmanNoiseModel = KalmanNoiseModel.STANDARD
+
+    # Optional scaling factors for the adaptive modes
+    volume_power: float = 0.6
+    parkinson_power: float = 1.0
+    r_floor: float = 1e-4
+    r_ceil: float = 5.0
+
+    # Back-compat alias used by older call sites (R=...)
+    R: Optional[float] = None
 
     def __post_init__(self):
+        if self.R is not None:
+            self.R_base = float(self.R)
+        if isinstance(self.noise_model, str):
+            self.noise_model = KalmanNoiseModel(self.noise_model)
         self.reset()
 
     def reset(self):
         self.x = np.zeros(2)                     # [α, β]
-        self.P = np.eye(2) * 1.0                 # state covariance
+        self.P = np.eye(2) * 1.0
         self.Q_base = self.delta * np.eye(2)
         self.innovations: List[float] = []
+        self._ewma_var = 1e-4
         self.history: List[dict] = []
-        self._ewma_var = None
 
     def _adapt_Q(self) -> np.ndarray:
-        """Scale process noise by recent |innovation| (adaptive Kalman)."""
         if len(self.innovations) < 5:
             return self.Q_base.copy()
         recent = np.array(self.innovations[-self.adapt_window:])
         scale = np.clip(np.std(recent) / (np.mean(np.abs(recent)) + 1e-8), 0.3, 5.0)
         return self.Q_base * scale
 
-    def update(self, price_a: float, price_b: float) -> dict:
-        """One-step predict + update. Returns current state diagnostics."""
-        # Observation matrix H = [1, price_b]
+    def _adapt_R(
+        self,
+        volume: Optional[float] = None,
+        high: Optional[float] = None,
+        low: Optional[float] = None,
+        price: Optional[float] = None,
+    ) -> float:
+        if self.noise_model == KalmanNoiseModel.STANDARD:
+            return float(self.R_base)
+
+        if self.noise_model == KalmanNoiseModel.VOLUME:
+            if volume is None or volume <= 0:
+                return float(self.R_base)
+            # `volume` is expected as relative volume (≈1.0 = typical).
+            # Higher relative volume → lower R (more trust in the print).
+            vol_factor = 1.0 / (1.0 + (float(volume) ** self.volume_power))
+            R = self.R_base * (0.35 + 1.3 * vol_factor)
+            return float(np.clip(R, self.r_floor, self.r_ceil))
+
+        if self.noise_model == KalmanNoiseModel.PARKINSON:
+            if high is None or low is None or high <= low:
+                return float(self.R_base)
+            range_proxy = max(np.log(high / low), 1e-6) ** 2
+            R = self.R_base * (1.0 + self.parkinson_power * range_proxy * 100)
+            return float(np.clip(R, self.r_floor, self.r_ceil))
+
+        return float(self.R_base)
+
+    def update(
+        self,
+        price_a: float,
+        price_b: float,
+        volume: Optional[float] = None,
+        high: Optional[float] = None,
+        low: Optional[float] = None,
+    ) -> dict:
         H = np.array([1.0, price_b])
 
-        # ----- Predict -----
         x_prior = self.x.copy()
         Q = self._adapt_Q()
         P_prior = self.P + Q
 
-        # ----- Update -----
+        R = self._adapt_R(volume=volume, high=high, low=low, price=price_a)
+
         y_pred = H @ x_prior
         innov = price_a - y_pred
-        S = float(H @ P_prior @ H.T + self.R)   # innovation variance
-        K = (P_prior @ H.T) / S                 # Kalman gain
+        S = float(H @ P_prior @ H.T + R)
+        K = (P_prior @ H.T) / S
 
         self.x = x_prior + K * innov
         self.P = (np.eye(2) - np.outer(K, H)) @ P_prior
@@ -361,60 +465,86 @@ class AdaptiveKalmanPairs:
         if len(self.innovations) > 200:
             self.innovations = self.innovations[-200:]
 
-        spread = innov                          # residual = observed − predicted
-        # Online estimate of residual std (EWMA)
-        if self._ewma_var is None:
-            self._ewma_var = max(S, 1e-6)
-        else:
-            self._ewma_var = 0.94 * self._ewma_var + 0.06 * innov**2
+        self._ewma_var = 0.94 * self._ewma_var + 0.06 * innov**2
         spread_std = float(np.sqrt(self._ewma_var + 1e-8))
+        z = innov / spread_std
 
-        z = spread / spread_std
-        # Confidence: higher when innovation variance is low relative to long-run
-        conf = 1.0 / (1.0 + np.sqrt(S))
+        conf = 1.0 / (1.0 + np.sqrt(S / max(R, 1e-8)))
         conf = float(np.clip(conf, self.min_conf, self.max_conf))
 
         out = {
             "alpha": float(self.x[0]),
             "beta": float(self.x[1]),
-            "spread": float(spread),
+            "spread": float(innov),
             "spread_std": float(spread_std),
             "zscore": float(z),
             "confidence": conf,
             "innovation": float(innov),
+            "R": float(R),
             "kalman_gain_beta": float(K[1]),
         }
         self.history.append(out)
         return out
 
-    def filter_pair(self, a: pd.Series, b: pd.Series) -> pd.DataFrame:
+    def filter_pair(
+        self,
+        a: pd.Series,
+        b: pd.Series,
+        volume: Optional[pd.Series] = None,
+        high: Optional[pd.Series] = None,
+        low: Optional[pd.Series] = None,
+    ) -> pd.DataFrame:
         """
         Run the filter over two aligned price series.
-        Returns a DataFrame with all diagnostics needed by the trading engine.
+        Optional volume / high / low enable the adaptive R modes.
         """
         self.reset()
         a = a.astype(float).dropna()
         b = b.astype(float).dropna()
         common = a.index.intersection(b.index)
+
+        if volume is not None:
+            volume = volume.reindex(common).fillna(0)
+            # Relative volume vs rolling median → stable VOLUME-mode R scaling
+            vol_med = volume.replace(0, np.nan).rolling(20, min_periods=5).median()
+            vol_med = vol_med.fillna(volume.replace(0, np.nan).median()).fillna(1.0)
+            volume = (volume / vol_med.replace(0, np.nan)).fillna(1.0).clip(0.05, 20.0)
+        if high is not None:
+            high = high.reindex(common)
+        if low is not None:
+            low = low.reindex(common)
+
         a, b = a.loc[common], b.loc[common]
 
-        # Calibrate noise to absolute price scale (R=1e-2 is for unit prices).
+        # Calibrate base noise to absolute price scale
         price_scale = float(max(np.nanmedian(np.abs(a.values)), 1.0))
-        self.R = max((price_scale ** 2) * 1e-4, 1e-6)
+        self.R_base = max((price_scale ** 2) * 1e-4, self.r_floor)
         self.Q_base = (self.delta * (price_scale ** 2)) * np.eye(2)
+        # For adaptive modes, raise ceiling with price scale
+        self.r_ceil = max(self.r_ceil, self.R_base * 50)
 
         rows = []
         prev_spread = 0.0
 
-        for ts, pa, pb in zip(common, a.values, b.values):
-            st = self.update(float(pa), float(pb))
+        for i, ts in enumerate(common):
+            vol = float(volume.iloc[i]) if volume is not None else None
+            hi = float(high.iloc[i]) if high is not None and pd.notna(high.iloc[i]) else None
+            lo = float(low.iloc[i]) if low is not None and pd.notna(low.iloc[i]) else None
+
+            st = self.update(
+                price_a=float(a.iloc[i]),
+                price_b=float(b.iloc[i]),
+                volume=vol,
+                high=hi,
+                low=lo,
+            )
             spread = st["spread"]
             velocity = spread - prev_spread
             prev_spread = spread
 
             rows.append({
-                "price_a": pa,
-                "price_b": pb,
+                "price_a": float(a.iloc[i]),
+                "price_b": float(b.iloc[i]),
                 "alpha": st["alpha"],
                 "beta": st["beta"],
                 "spread": spread,
@@ -423,19 +553,22 @@ class AdaptiveKalmanPairs:
                 "spread_velocity": velocity,
                 "spread_vol": st["spread_std"],
                 "innovation": st["innovation"],
+                "R": st["R"],
             })
 
         df = pd.DataFrame(rows, index=common)
 
-        # Extra rolling diagnostics useful for exit features
-        df["spread_velocity"] = df["spread"].diff().rolling(5, min_periods=1).mean().fillna(0)
-        df["spread_vol"] = df["spread"].rolling(15, min_periods=5).std().fillna(df["spread_vol"])
-        # Trading z-score: rolling standardize the Kalman residual (online EWMA z
-        # adapts too fast to ever reach classic ±2 entry thresholds).
+        df["spread_velocity"] = (
+            df["spread"].diff().rolling(5, min_periods=1).mean().fillna(0)
+        )
+        df["spread_vol"] = (
+            df["spread"].rolling(15, min_periods=5).std().fillna(df["spread_vol"])
+        )
+        # Keep online z, but use rolling residual z for trading thresholds (±2)
+        df["zscore_online"] = df["zscore"]
         roll_mu = df["spread"].rolling(40, min_periods=10).mean()
         roll_sd = df["spread"].rolling(40, min_periods=10).std()
         df["zscore"] = ((df["spread"] - roll_mu) / roll_sd.replace(0, np.nan)).fillna(0.0)
-        # Regime confidence from relative residual vol (tradeable scale)
         roll = df["spread"].rolling(20, min_periods=5).std()
         med = float(roll.median()) if roll.notna().any() else 1.0
         df["confidence"] = (med / (med + roll)).clip(self.min_conf, self.max_conf).fillna(self.min_conf)
@@ -1034,6 +1167,7 @@ def run_paper_trading_and_train(
     include_cross: bool = True,
     max_pairs_per_basket: int = 6,
     ml_threshold: float = 0.62,
+    noise_model: KalmanNoiseModel | str = KalmanNoiseModel.STANDARD,
 ):
     print("Starting Paper Trading Session...")
     print("Goal: Complete at least", min_trades, "round-trip trades\n")
@@ -1047,11 +1181,18 @@ def run_paper_trading_and_train(
     )
     summarize_universes(pairs)
 
-    # 1. Prices: yfinance only; trades restricted to latest calendar year
+    # 1. OHLCV: yfinance only; trades restricted to latest calendar year
     tickers = all_universe_tickers(baskets)
-    prices, data_source = _load_prices_for_universe(tickers, n_bars)
+    panels, data_source = _load_prices_for_universe(tickers, n_bars)
+    prices = panels["close"]
+    highs = panels["high"]
+    lows = panels["low"]
+    volumes = panels["volume"]
     trade_year = int(prices.attrs.get("trade_year", pd.Timestamp(prices.index.max()).year))
+    if isinstance(noise_model, str):
+        noise_model = KalmanNoiseModel(noise_model)
     print(f"\nPrice panel: {prices.shape[1]} tickers × {prices.shape[0]} bars  [source: {data_source}]")
+    print(f"Kalman R mode: {noise_model.value}")
     print(f"Trade windows: {trade_year} only (no prior-year entries)\n")
 
     # Try to load a previously trained model (rule-only if missing)
@@ -1067,7 +1208,7 @@ def run_paper_trading_and_train(
 
     # 2–3. Adaptive Kalman filter + paper trader (ML-augmented exits when model present)
     trader = PaperTrader()
-    kf = AdaptiveKalmanPairs(delta=1e-4, R=1e-2)
+    kf = AdaptiveKalmanPairs(delta=1e-4, R_base=1e-2, noise_model=noise_model)
     pair_frames: Dict[str, pd.DataFrame] = {}
     closed_count = 0
 
@@ -1079,10 +1220,19 @@ def run_paper_trading_and_train(
 
         price_a = prices[pair.ticker_a]
         price_b = prices[pair.ticker_b]
-        df = kf.filter_pair(price_a, price_b)
+        vol_a = volumes[pair.ticker_a] if pair.ticker_a in volumes.columns else None
+        hi_a = highs[pair.ticker_a] if pair.ticker_a in highs.columns else None
+        lo_a = lows[pair.ticker_a] if pair.ticker_a in lows.columns else None
+        df = kf.filter_pair(
+            price_a,
+            price_b,
+            volume=vol_a if noise_model == KalmanNoiseModel.VOLUME else None,
+            high=hi_a if noise_model == KalmanNoiseModel.PARKINSON else None,
+            low=lo_a if noise_model == KalmanNoiseModel.PARKINSON else None,
+        )
         pair_frames[pair.label] = df
 
-        print(f"\n--- Scanning {pair.label} [{pair.basket}] (year={trade_year}) ---")
+        print(f"\n--- Scanning {pair.label} [{pair.basket}] (year={trade_year}, R={noise_model.value}) ---")
         opened = _trade_pair_session(
             trader, df, pair,
             min_trades=min_trades,
@@ -1135,6 +1285,12 @@ if __name__ == "__main__":
         default=0.62,
         help="ML exit probability threshold for forced exits (default 0.62)",
     )
+    parser.add_argument(
+        "--noise-model",
+        choices=[m.value for m in KalmanNoiseModel],
+        default=KalmanNoiseModel.STANDARD.value,
+        help="Kalman measurement-noise mode: standard | volume | parkinson",
+    )
     args = parser.parse_args()
 
     if args.train_only:
@@ -1147,6 +1303,7 @@ if __name__ == "__main__":
             baskets=["mag7", "semis", "memory", "hyperscaler"],
             include_cross=True,
             ml_threshold=args.ml_threshold,
+            noise_model=args.noise_model,
         )
 
         if model is None:

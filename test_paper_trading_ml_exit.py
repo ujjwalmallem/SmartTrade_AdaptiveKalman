@@ -32,7 +32,7 @@ class TestAdaptiveKalmanPairs(unittest.TestCase):
         df = kf.filter_pair(self.a, self.b)
         required = {
             "price_a", "price_b", "alpha", "beta", "spread", "zscore",
-            "confidence", "spread_velocity", "spread_vol", "innovation",
+            "confidence", "spread_velocity", "spread_vol", "innovation", "R",
         }
         self.assertTrue(required.issubset(df.columns))
         self.assertEqual(len(df), len(self.a))
@@ -51,6 +51,33 @@ class TestAdaptiveKalmanPairs(unittest.TestCase):
         d2 = kf.filter_pair(self.a, self.b)
         self.assertEqual(len(d1), len(d2))
         self.assertEqual(len(kf.history), hist_len)  # reset each run
+
+    def test_volume_mode_adapts_R(self):
+        rng = np.random.default_rng(1)
+        vol = pd.Series(
+            rng.integers(5e5, 8e6, size=len(self.a)).astype(float),
+            index=self.a.index,
+        )
+        kf = m.AdaptiveKalmanPairs(noise_model=m.KalmanNoiseModel.VOLUME)
+        df = kf.filter_pair(self.a, self.b, volume=vol)
+        self.assertIn("R", df.columns)
+        self.assertTrue(np.isfinite(df["R"]).all())
+        self.assertGreater(df["R"].std(), 0.0)
+
+    def test_parkinson_mode_adapts_R(self):
+        rng = np.random.default_rng(2)
+        noise = rng.uniform(0.2, 2.5, size=len(self.a))
+        high = self.a + noise
+        low = self.a - noise
+        kf = m.AdaptiveKalmanPairs(noise_model=m.KalmanNoiseModel.PARKINSON)
+        df = kf.filter_pair(self.a, self.b, high=high, low=low)
+        self.assertIn("R", df.columns)
+        self.assertTrue(np.isfinite(df["R"]).all())
+        self.assertGreater(df["R"].max(), df["R"].min())
+
+    def test_noise_model_string_accepted(self):
+        kf = m.AdaptiveKalmanPairs(noise_model="standard")
+        self.assertEqual(kf.noise_model, m.KalmanNoiseModel.STANDARD)
 
 
 class TestExitFeatures(unittest.TestCase):
