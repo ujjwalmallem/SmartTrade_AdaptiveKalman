@@ -12,7 +12,7 @@ python paper_trading_ml_exit.py --noise-model parkinson   # Parkinson high-low R
 python paper_trading_ml_exit.py --train-only   # retrain from results/
 ```
 
-**Data:** OHLCV from **yfinance only** (no synthetic). Close is always used; High/Low/Volume enable adaptive Kalman R modes. Trade windows and training samples are restricted to the **latest calendar year** (e.g. 2026) — prior years like 2025 are excluded.
+**Data:** per-ticker OHLCV from **yfinance only** (no synthetic). Each ticker panel includes Open/High/Low/Close/Volume; High/Low/Volume feed adaptive Kalman R modes. Trade windows and training samples are restricted to the **latest calendar year** (e.g. 2026) — prior years like 2025 are excluded.
 
 **Kalman R modes** (`--noise-model`):
 - `standard` — fixed (price-scale calibrated) measurement noise

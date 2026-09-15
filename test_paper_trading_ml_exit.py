@@ -202,6 +202,35 @@ class TestShouldExitWithML(unittest.TestCase):
         self.assertLess(proba, 0.38)
 
 
+class TestOHLCVLoader(unittest.TestCase):
+    def test_fetch_returns_per_ticker_ohlcv(self):
+        panels = m.fetch_real_prices_for_universe(["AAPL", "MSFT", "NVDA"], n_bars=400)
+        self.assertGreaterEqual(len(panels), 2)
+        for ticker, df in panels.items():
+            self.assertIn("Close", df.columns)
+            self.assertTrue({"High", "Low", "Volume"}.issubset(df.columns))
+            self.assertGreater(len(df), 40)
+            self.assertIn("trade_year", df.attrs)
+            self.assertEqual(int(df.attrs["trade_year"]), 2026)
+        # All tickers share the same index
+        idxs = [tuple(df.index) for df in panels.values()]
+        self.assertTrue(all(ix == idxs[0] for ix in idxs))
+
+    def test_field_panels_helper(self):
+        panels = m.fetch_real_prices_for_universe(["AAPL", "MSFT"], n_bars=400)
+        fields = m.ohlcv_field_panels(panels)
+        self.assertEqual(set(fields), {"close", "high", "low", "volume"})
+        self.assertTrue(fields["close"].columns.equals(pd.Index(list(panels.keys()))))
+        self.assertEqual(fields["close"].attrs.get("trade_year"), 2026)
+
+    def test_load_prices_returns_ticker_panels(self):
+        panels, source = m._load_prices_for_universe(["AAPL", "MSFT", "GOOGL"], n_bars=400)
+        self.assertEqual(source, "yfinance_live")
+        self.assertNotIn("close", panels)  # ticker-keyed, not field-keyed
+        self.assertIn("AAPL", panels)
+        self.assertIn("Close", panels["AAPL"].columns
+
+
 class TestLatestYearFilter(unittest.TestCase):
     def test_filter_drops_2025_keeps_2026(self):
         df = pd.DataFrame({

@@ -197,7 +197,7 @@ class PositionState:
     current_size: float = 0.0
     bars_held: int = 0
 
-def fetch_market_panels_for_universe(
+def fetch_real_prices_for_universe(
     tickers: Sequence[str],
     n_bars: int = 700,
     period: str = "2y",
@@ -205,16 +205,21 @@ def fetch_market_panels_for_universe(
     trade_year: Optional[int] = None,
 ) -> Dict[str, pd.DataFrame]:
     """
-    Real OHLCV via yfinance only (no synthetic data).
+    Real daily OHLCV via yfinance only (no synthetic data).
 
-    Returns dict with keys: close, high, low, volume — each a ticker panel
-    aligned on the same trading days. Trade windows use the latest calendar
-    year; a short prior-year warm-up is kept for indicators.
+    Returns a dict of DataFrames, one per ticker, each containing:
+        Open, High, Low, Close, Volume
+    (Open is included for completeness; we mainly use H/L/C/V).
+
+    Aligns tickers on shared trading days. Keeps enough history for
+    indicator warm-up, but trade windows are restricted to `trade_year`
+    (default: the calendar year of the latest bar).
     """
     import yfinance as yf
 
-    tickers = list(dict.fromkeys(tickers))
+    tickers = list(dict.fromkeys(tickers))  # de-dup, preserve order
     print(f"Fetching yfinance OHLCV for {len(tickers)} tickers (period={period})...")
+
     raw = yf.download(
         tickers=tickers,
         period=period,
@@ -224,112 +229,125 @@ def fetch_market_panels_for_universe(
         progress=False,
         threads=True,
     )
+
     if raw is None or raw.empty:
         raise RuntimeError("yfinance returned no data")
 
-    fields = {"Close": "close", "High": "high", "Low": "low", "Volume": "volume"}
-    series_maps: Dict[str, Dict[str, pd.Series]] = {v: {} for v in fields.values()}
+    panels: Dict[str, pd.DataFrame] = {}
 
     for t in tickers:
         try:
             if isinstance(raw.columns, pd.MultiIndex):
-                block = raw[t]
+                df = raw[t].copy()
             else:
-                block = raw
-        except KeyError:
-            continue
-        try:
-            close = pd.to_numeric(block["Close"], errors="coerce")
-        except KeyError:
-            continue
-        close = close.dropna()
-        if len(close) < min_bars:
-            continue
-        series_maps["close"][t] = close.rename(t)
-        for src, dst in fields.items():
-            if dst == "close":
-                continue
-            if src in block.columns:
-                series_maps[dst][t] = pd.to_numeric(block[src], errors="coerce").rename(t)
-            else:
-                series_maps[dst][t] = pd.Series(np.nan, index=close.index, name=t)
+                # single-ticker case
+                df = raw.copy()
 
-    missing = [t for t in tickers if t not in series_maps["close"]]
+            cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            if "Close" not in cols:
+                continue
+            df = df[cols].copy()
+            df = df.apply(pd.to_numeric, errors="coerce").dropna(how="all")
+
+            if df["Close"].dropna().shape[0] >= min_bars:
+                panels[t] = df
+        except Exception:
+            continue
+
+    missing = [t for t in tickers if t not in panels]
     if missing:
         print(f"⚠️  Dropping tickers with no usable yfinance history: {', '.join(missing)}")
-    if len(series_maps["close"]) < 2:
+
+    if len(panels) < 2:
         raise RuntimeError(
-            "yfinance returned usable closes for fewer than 2 tickers; "
+            "yfinance returned usable OHLCV for fewer than 2 tickers; "
             "cannot build pairs for training"
         )
 
-    closes = pd.DataFrame(series_maps["close"]).dropna(how="any")
+    # Align all tickers on the intersection of trading days (Close as reference)
+    closes = pd.DataFrame({t: panels[t]["Close"] for t in panels}).dropna(how="any")
     if closes.empty:
         raise RuntimeError("No overlapping trading days across fetched tickers")
 
-    # Align other fields to the close index/columns
-    idx = closes.index
-    cols = closes.columns
-    highs = pd.DataFrame(series_maps["high"]).reindex(index=idx, columns=cols)
-    lows = pd.DataFrame(series_maps["low"]).reindex(index=idx, columns=cols)
-    volumes = pd.DataFrame(series_maps["volume"]).reindex(index=idx, columns=cols).fillna(0.0)
+    closes = closes.tail(max(n_bars, min_bars + 60))
+    common_index = closes.index
 
-    # Prefer a recent window that still leaves warm-up bars before trade_year.
-    keep = max(n_bars, min_bars + 60)
-    closes = closes.tail(keep)
-    highs = highs.loc[closes.index]
-    lows = lows.loc[closes.index]
-    volumes = volumes.loc[closes.index]
-
-    latest_year = int(pd.Timestamp(closes.index.max()).year)
+    latest_year = int(pd.Timestamp(common_index.max()).year)
     year = int(trade_year) if trade_year is not None else latest_year
     if year != latest_year:
         print(f"⚠️  Requested trade_year={year} but latest bar is {latest_year}; using {latest_year}")
         year = latest_year
 
-    in_year = closes.index.year == year
+    in_year = common_index.year == year
     if not in_year.any():
         raise RuntimeError(f"No yfinance bars in latest year {year}")
 
     first_trade_i = int(in_year.argmax())
     warm_start = max(0, first_trade_i - 60)
-    closes = closes.iloc[warm_start:]
-    highs = highs.loc[closes.index]
-    lows = lows.loc[closes.index]
-    volumes = volumes.loc[closes.index]
+    final_index = common_index[warm_start:]
 
-    trade_bars = int((closes.index.year == year).sum())
+    # Keep every ticker on the exact same calendar so pair scans stay aligned
+    for t in list(panels.keys()):
+        frame = panels[t].reindex(final_index)
+        if "Volume" in frame.columns:
+            frame["Volume"] = frame["Volume"].fillna(0.0)
+        for col in ("Open", "High", "Low", "Close"):
+            if col in frame.columns:
+                frame[col] = frame[col].ffill()
+        panels[t] = frame
+        panels[t].attrs["trade_year"] = year
+
+    trade_bars = int((final_index.year == year).sum())
     if trade_bars < 40:
         raise RuntimeError(
             f"Only {trade_bars} bars in trade year {year}; need more latest-year history"
         )
 
     print(
-        f"yfinance OHLCV ready: {closes.shape[1]} tickers × {closes.shape[0]} bars "
-        f"[{closes.index.min().date()} → {closes.index.max().date()}] "
+        f"yfinance OHLCV ready: {len(panels)} tickers × {len(final_index)} bars "
+        f"[{final_index.min().date()} → {final_index.max().date()}] "
         f"(trades restricted to {year}: {trade_bars} bars)"
     )
-    closes.attrs["trade_year"] = year
-    return {
-        "close": closes,
-        "high": highs,
-        "low": lows,
-        "volume": volumes,
-    }
+    return panels
 
 
-def fetch_real_prices_for_universe(
+def ohlcv_field_panels(ticker_panels: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    """
+    Convenience views: close / high / low / volume as ticker-column DataFrames.
+    """
+    closes = pd.DataFrame({t: df["Close"] for t, df in ticker_panels.items()})
+    highs = pd.DataFrame({t: df["High"] for t, df in ticker_panels.items() if "High" in df.columns})
+    lows = pd.DataFrame({t: df["Low"] for t, df in ticker_panels.items() if "Low" in df.columns})
+    volumes = pd.DataFrame(
+        {t: df["Volume"] for t, df in ticker_panels.items() if "Volume" in df.columns}
+    ).fillna(0.0)
+
+    trade_year = None
+    for df in ticker_panels.values():
+        trade_year = df.attrs.get("trade_year")
+        if trade_year is not None:
+            break
+    if trade_year is not None:
+        closes.attrs["trade_year"] = int(trade_year)
+    return {"close": closes, "high": highs, "low": lows, "volume": volumes}
+
+
+def fetch_market_panels_for_universe(
     tickers: Sequence[str],
     n_bars: int = 700,
     period: str = "2y",
     min_bars: int = 80,
     trade_year: Optional[int] = None,
-) -> pd.DataFrame:
-    """Backward-compatible close-only panel (from OHLCV fetch). """
-    panels = fetch_market_panels_for_universe(
-        tickers, n_bars=n_bars, period=period, min_bars=min_bars, trade_year=trade_year
+) -> Dict[str, pd.DataFrame]:
+    """
+    Field-oriented OHLCV panels (close/high/low/volume).
+    Thin wrapper over per-ticker fetch_real_prices_for_universe.
+    """
+    return ohlcv_field_panels(
+        fetch_real_prices_for_universe(
+            tickers, n_bars=n_bars, period=period, min_bars=min_bars, trade_year=trade_year
+        )
     )
-    return panels["close"]
 
 
 def _load_prices_for_universe(
@@ -338,10 +356,10 @@ def _load_prices_for_universe(
     trade_year: Optional[int] = None,
 ) -> Tuple[Dict[str, pd.DataFrame], str]:
     """
-    Load OHLCV for training. yfinance only — never synthesizes data.
+    Load full OHLCV panels (keyed by ticker). yfinance only — never synthesizes data.
     Returns (panels_dict, source_label).
     """
-    panels = fetch_market_panels_for_universe(
+    panels = fetch_real_prices_for_universe(
         tickers, n_bars=n_bars, trade_year=trade_year
     )
     return panels, "yfinance_live"
@@ -1181,14 +1199,18 @@ def run_paper_trading_and_train(
     )
     summarize_universes(pairs)
 
-    # 1. OHLCV: yfinance only; trades restricted to latest calendar year
+    # 1. Full OHLCV: yfinance only; trades restricted to latest calendar year
     tickers = all_universe_tickers(baskets)
     panels, data_source = _load_prices_for_universe(tickers, n_bars)
-    prices = panels["close"]
-    highs = panels["high"]
-    lows = panels["low"]
-    volumes = panels["volume"]
-    trade_year = int(prices.attrs.get("trade_year", pd.Timestamp(prices.index.max()).year))
+    trade_year = int(next(iter(panels.values())).attrs.get(
+        "trade_year", pd.Timestamp(next(iter(panels.values())).index.max()).year
+    ))
+    # Convenience field views for Kalman / pair scans
+    fields = ohlcv_field_panels(panels)
+    prices = fields["close"]
+    highs = fields["high"]
+    lows = fields["low"]
+    volumes = fields["volume"]
     if isinstance(noise_model, str):
         noise_model = KalmanNoiseModel(noise_model)
     print(f"\nPrice panel: {prices.shape[1]} tickers × {prices.shape[0]} bars  [source: {data_source}]")
@@ -1226,9 +1248,9 @@ def run_paper_trading_and_train(
         df = kf.filter_pair(
             price_a,
             price_b,
-            volume=vol_a if noise_model == KalmanNoiseModel.VOLUME else None,
-            high=hi_a if noise_model == KalmanNoiseModel.PARKINSON else None,
-            low=lo_a if noise_model == KalmanNoiseModel.PARKINSON else None,
+            volume=vol_a,
+            high=hi_a,
+            low=lo_a,
         )
         pair_frames[pair.label] = df
 
