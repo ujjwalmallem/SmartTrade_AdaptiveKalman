@@ -51,7 +51,23 @@ jobs:
           fi
 
       - name: Run paper trading + ML exit trainer
-        run: python paper_trading_ml_exit.py
+        env:
+          # Repo → Settings → Secrets and variables → Actions
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+          # Accepted aliases
+          APCA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY }}
+          APCA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ALPACA_API_KEY:-}" ] && [ -n "${ALPACA_API_SECRET_KEY:-}" ]; then
+            echo "🏦 Alpaca secrets present — paper brokerage for latest-bar fills"
+            python paper_trading_ml_exit.py --broker alpaca
+          else
+            echo "📒 No Alpaca secrets — local simulator only"
+            echo "   Add ALPACA_API_KEY and ALPACA_API_SECRET_KEY under Repo Settings → Secrets"
+            python paper_trading_ml_exit.py --broker sim
+          fi
 
       - name: Retrain from stored results
         run: python paper_trading_ml_exit.py --train-only

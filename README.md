@@ -12,12 +12,26 @@ python paper_trading_ml_exit.py --noise-model volume
 python paper_trading_ml_exit.py --train-only
 ```
 
-**Brokerage:** default is a local simulator. With `--broker alpaca`, entry/exit on the **latest bar only** are submitted to the Alpaca **paper** API (never live). Set:
+**Brokerage:** default is a local simulator. With `--broker alpaca`, entry/exit on the **latest bar only** are submitted to the Alpaca **paper** API (never live).
+
+### GitHub Secrets (recommended for CI)
+
+1. Open the repo → **Settings → Secrets and variables → Actions → New repository secret**
+2. Add exactly these names (paper keys only — never live keys):
+   - `ALPACA_API_KEY`
+   - `ALPACA_API_SECRET_KEY`
+3. Push or run **Paper Trading CI** (`workflow_dispatch`). If both secrets exist, CI runs `--broker alpaca`; otherwise it falls back to `--broker sim`.
+
+Do **not** put keys in the repo, `.env` commits, workflow logs, or PR text.
+
+### Local env
 
 ```bash
+cp .env.example .env   # then edit; .env is gitignored
 export ALPACA_API_KEY=...
 export ALPACA_API_SECRET_KEY=...
 # (aliases APCA_API_KEY_ID / APCA_API_SECRET_KEY also work)
+python paper_trading_ml_exit.py --broker alpaca
 ```
 
 Historical bars still drive Kalman / ML training in-process; only the most recent signal date is routed to Alpaca so replay does not spam orders.
@@ -44,4 +58,4 @@ Create 6 weekday automations (pre / RTH / post), cron in UTC, prompt from [`auto
 
 ## Backup: GitHub Actions
 
-`.github/workflows/paper-trading.yml` still runs on push/PR and external `workflow_dispatch`, and uploads `results/` as artifacts.
+`.github/workflows/paper-trading.yml` runs on push/PR and external `workflow_dispatch`, uploads `results/` as artifacts, and uses GitHub Secrets for Alpaca paper when configured (see above).
