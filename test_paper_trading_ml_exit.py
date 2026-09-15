@@ -95,9 +95,7 @@ class TestExitFeatures(unittest.TestCase):
         self.assertEqual(feat[1], 2.0)           # abs_entry_z
         self.assertAlmostEqual(feat[2], 1.5)     # pnl_proxy = -0.5 - (-2.0)
         self.assertAlmostEqual(feat[3], 12 / 30)
-        # confidence is dynamically scaled by half-life
-        self.assertLess(feat[4], 0.7)
-        self.assertGreater(feat[4], 0.3)
+        self.assertEqual(feat[4], 0.7)          # raw Kalman confidence
         self.assertEqual(feat[6], -0.5)          # current z
         self.assertAlmostEqual(feat[10], 15.0 / 30.0)  # half_life
         self.assertGreaterEqual(pos.highest_favorable_z, 1.5)

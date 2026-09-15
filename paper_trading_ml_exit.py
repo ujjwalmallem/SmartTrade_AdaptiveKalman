@@ -668,16 +668,12 @@ def estimate_half_life(spread: pd.Series, lookback: int = 40) -> float:
     s = spread.iloc[-lookback:].astype(float)
     lag = s.shift(1).dropna()
     delta = s.diff().dropna()
-    n = min(len(lag), len(delta))
-    if n < 10:
-        return 30.0
-    lag = lag.iloc[-n:]
-    delta = delta.iloc[-n:]
+    lag = lag.iloc[-len(delta):]
     if float(lag.std()) < 1e-8:
         return 30.0
     beta = float(np.polyfit(lag.values, delta.values, 1)[0])
     if beta >= 0:
-        return 60.0  # not mean-reverting
+        return 60.0
     hl = np.log(2) / abs(beta)
     return float(np.clip(hl, 2.0, 60.0))
 
@@ -690,7 +686,7 @@ def extract_exit_features(
     half_life: float = 20.0,
 ) -> np.ndarray:
     """
-    Build the feature vector used by LogisticExitModel.
+    Build the 11-d feature vector used by LogisticExitModel.
     Includes OU half-life as a mean-reversion strength signal.
     Order matches FEATURE_NAMES.
     """
@@ -698,10 +694,6 @@ def extract_exit_features(
     conf = float(row.get("confidence", 0.5))
     vel = float(row.get("spread_velocity", 0.0))
     vol = float(row.get("spread_vol", 1.0))
-    hl = float(half_life)
-
-    # Dynamic confidence: trust prints more when half-life is short
-    conf = float(np.clip(conf * (30.0 / (30.0 + hl)), 0.05, 0.99))
 
     if direction == 1:
         pnl_proxy = z - position.entry_z
@@ -711,21 +703,19 @@ def extract_exit_features(
         favorable = max(0.0, position.entry_z - z)
 
     position.highest_favorable_z = max(position.highest_favorable_z, favorable)
-    best_fav = position.highest_favorable_z
-    bars_norm = bars_held / 30.0
 
     return np.array([
         position.entry_z,
         abs(position.entry_z),
         pnl_proxy,
-        bars_norm,
+        bars_held / 30.0,
         conf,
         vel,
         z,
         favorable,
-        best_fav,
+        position.highest_favorable_z,
         vol,
-        hl / 30.0,
+        float(half_life) / 30.0,
     ], dtype=float)
 
 
@@ -1197,7 +1187,13 @@ def _trade_pair_session(
     model: Optional[LogisticExitModel] = None,
     ml_threshold: float = 0.62,
 ) -> int:
-    """Run entries + ML-augmented exits on one pair."""
+    """
+    Run rule-based entries + ML-augmented exits on one pair.
+    Returns the number of newly closed trades.
+
+    Wires Adaptive Kalman features (incl. half-life), ML exit probability,
+    exact live feature logging, and cost-aware dollar PnL on close.
+    """
     position = 0
     entry_idx = 0
     opened = 0
@@ -1220,6 +1216,8 @@ def _trade_pair_session(
         if position == 0:
             if not in_trade_year:
                 continue
+
+            # Classic z-score entry with confidence filter
             if z < -2.0 and conf > 0.55:
                 position = 1
                 entry_idx = i
@@ -1231,9 +1229,16 @@ def _trade_pair_session(
                     highest_favorable_z=0.0,
                 )
                 trader.open_trade(
-                    1, time, z, row["spread"],
-                    ticker_a=pair.ticker_a, ticker_b=pair.ticker_b, basket=pair.basket,
+                    direction=1,
+                    time=time,
+                    z=z,
+                    spread=row["spread"],
+                    ticker_a=pair.ticker_a,
+                    ticker_b=pair.ticker_b,
+                    basket=pair.basket,
+                    risk_frac=0.08,
                 )
+
             elif z > 2.0 and conf > 0.55:
                 position = -1
                 entry_idx = i
@@ -1245,18 +1250,31 @@ def _trade_pair_session(
                     highest_favorable_z=0.0,
                 )
                 trader.open_trade(
-                    -1, time, z, row["spread"],
-                    ticker_a=pair.ticker_a, ticker_b=pair.ticker_b, basket=pair.basket,
+                    direction=-1,
+                    time=time,
+                    z=z,
+                    spread=row["spread"],
+                    ticker_a=pair.ticker_a,
+                    ticker_b=pair.ticker_b,
+                    basket=pair.basket,
+                    risk_frac=0.08,
                 )
 
-        # ---------- EXIT (ML + rules) ----------
+        # ---------- EXIT (rules + ML + half-life) ----------
         elif position != 0:
             bars_held = i - entry_idx
             pos_state.bars_held = bars_held
-            # Refresh half-life every bar (cheap AR(1) on recent spread)
-            hl = estimate_half_life(df["spread"].iloc[: i + 1])
+
+            # Live half-life of the spread (mean-reversion speed)
+            half_life = estimate_half_life(df["spread"].iloc[: i + 1], lookback=40)
+
+            # Exact feature vector the model will see
             features = extract_exit_features(
-                pos_state, row, bars_held, position, half_life=hl,
+                position=pos_state,
+                row=row,
+                bars_held=bars_held,
+                direction=position,
+                half_life=half_life,
             )
 
             should_exit, ml_proba = should_exit_with_ml(
@@ -1270,14 +1288,16 @@ def _trade_pair_session(
 
             if should_exit:
                 trader.close_trade(
-                    time, z, row["spread"],
+                    time=time,
+                    z=z,
+                    spread=row["spread"],
                     ml_proba=ml_proba,
-                    features=features,
-                    bars_held=bars_held,
+                    features=features,  # exact vector stored on the trade
+                    bars_held=bars_held,  # bar count (not calendar days)
                 )
                 position = 0
-                pos_state = PositionState()
                 opened += 1
+
                 if opened >= trades_remaining:
                     break
 
