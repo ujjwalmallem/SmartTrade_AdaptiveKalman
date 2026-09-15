@@ -32,7 +32,10 @@ jobs:
           pip install -r requirements.txt
 
       - name: Syntax check
-        run: python -m py_compile paper_trading_ml_exit.py
+        run: python -m py_compile paper_trading_ml_exit.py alpaca_paper_broker.py
+
+      - name: Unit tests
+        run: python -m unittest test_paper_trading_ml_exit.py -v
 
       - name: Restore accumulated results from results-data branch
         run: |

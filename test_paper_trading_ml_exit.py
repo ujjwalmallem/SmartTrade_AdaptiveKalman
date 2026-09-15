@@ -337,5 +337,42 @@ class TestEndToEndYfinance(unittest.TestCase):
             self.assertIn("feat_half_life", pd.read_csv(tmp_path / "exit_training_dataset.csv").columns)
 
 
+
+class TestAlpacaBroker(unittest.TestCase):
+    def test_dry_run_pair_round_trip(self):
+        from alpaca_paper_broker import AlpacaPaperBroker
+        br = AlpacaPaperBroker(paper=True, dry_run=True)
+        opened = br.open_pair("AAPL", "MSFT", "LONG_SPREAD", 8000, 180.0, 400.0)
+        self.assertEqual(len(opened.fills), 2)
+        self.assertEqual(opened.fills[0].side, "buy")
+        self.assertEqual(opened.fills[1].side, "sell")
+        closed = br.close_pair("AAPL", "MSFT", opened.fills[0].qty, opened.fills[1].qty, "LONG_SPREAD")
+        self.assertEqual(len(closed.fills), 2)
+
+    def test_trader_routes_only_latest_bar(self):
+        br = m.AlpacaPaperBroker(paper=True, dry_run=True)
+        latest = pd.Timestamp("2026-09-14")
+        trader = m.PaperTrader(broker=br, execute_latest_only=True, latest_bar=latest)
+        # Historical bar → sim only
+        trader.open_trade(
+            1, pd.Timestamp("2026-04-13"), -2.1, 1.0,
+            "AAPL", "MSFT", "mag7", price_a=180, price_b=400,
+        )
+        self.assertEqual(trader.trades[0].broker, "sim")
+        trader.close_trade(pd.Timestamp("2026-04-17"), -0.2, 0.5, bars_held=4)
+        # Latest bar → alpaca paper
+        trader.open_trade(
+            1, latest, -2.2, 1.0,
+            "AAPL", "MSFT", "mag7", price_a=180, price_b=400,
+        )
+        self.assertEqual(trader.trades[-1].broker, "alpaca_paper")
+        self.assertGreater(trader.trades[-1].qty_a, 0)
+        trader.close_trade(latest, -0.3, 0.4, bars_held=1)
+        self.assertTrue(any(t.broker == "alpaca_paper" for t in trader.trades if t.status == "CLOSED"))
+
+    def test_build_broker_sim_is_none(self):
+        self.assertIsNone(m.build_broker("sim"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

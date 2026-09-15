@@ -12,9 +12,12 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import List, Dict, Iterable, Optional, Sequence, Tuple
+from typing import List, Dict, Iterable, Optional, Sequence, Tuple, Any
+import os
 import warnings
 warnings.filterwarnings("ignore")
+
+from alpaca_paper_broker import AlpacaPaperBroker, alpaca_credentials_present
 
 # Default artifact locations (gitignored locally; CI uploads as artifacts)
 RESULTS_DIR = Path("results")
@@ -795,6 +798,10 @@ def closed_trades_to_frame(
             "notional": t.notional,
             "pnl_dollars": t.pnl_dollars,
             "cost_dollars": t.cost_dollars,
+            "broker": t.broker,
+            "qty_a": t.qty_a,
+            "qty_b": t.qty_b,
+            "alpaca_order_ids": json.dumps(t.alpaca_order_ids or []),
             "ml_proba_at_exit": t.ml_proba_at_exit,
             "label": trade_to_label(t),
             "exit_features_json": (
@@ -994,17 +1001,48 @@ class PaperTrade:
     ml_proba_at_exit: float = None
     # Exact feature vector at exit time (from extract_exit_features)
     exit_features: Optional[np.ndarray] = None
+    broker: str = "sim"
+    qty_a: float = 0.0
+    qty_b: float = 0.0
+    alpaca_order_ids: Optional[List[str]] = None
 
 
 class PaperTrader:
-    def __init__(self, capital=100_000, cost_bps: float = 4.0, risk_frac: float = 0.08):
+    def __init__(
+        self,
+        capital=100_000,
+        cost_bps: float = 4.0,
+        risk_frac: float = 0.08,
+        broker: Optional[AlpacaPaperBroker] = None,
+        execute_latest_only: bool = True,
+        latest_bar: Optional[pd.Timestamp] = None,
+    ):
         self.capital = capital
         self.equity = capital
         self.cost_bps = cost_bps          # round-trip cost in basis points
         self.risk_frac = risk_frac
+        self.broker = broker
+        self.execute_latest_only = bool(execute_latest_only)
+        self.latest_bar = pd.Timestamp(latest_bar) if latest_bar is not None else None
         self.trades: List[PaperTrade] = []
         self.current_trade: Optional[PaperTrade] = None
         self.trade_counter = 0
+
+        if self.broker is not None:
+            eq = self.broker.get_equity()
+            if eq is not None and eq > 0:
+                self.capital = float(eq)
+                self.equity = float(eq)
+                print(f"🏦 Alpaca paper equity synced: ${self.equity:,.2f}")
+
+    def _should_route_to_broker(self, time) -> bool:
+        if self.broker is None:
+            return False
+        if not self.execute_latest_only:
+            return True
+        if self.latest_bar is None:
+            return False
+        return pd.Timestamp(time).normalize() == pd.Timestamp(self.latest_bar).normalize()
 
     def open_trade(
         self,
@@ -1016,6 +1054,8 @@ class PaperTrader:
         ticker_b="",
         basket="",
         risk_frac: Optional[float] = None,
+        price_a: Optional[float] = None,
+        price_b: Optional[float] = None,
     ):
         self.trade_counter += 1
         side = "LONG_SPREAD" if direction == 1 else "SHORT_SPREAD"
@@ -1032,11 +1072,36 @@ class PaperTrader:
             ticker_b=ticker_b,
             basket=basket,
             notional=notional,
+            broker="sim",
         )
+
+        if (
+            self._should_route_to_broker(time)
+            and ticker_a and ticker_b
+            and price_a and price_b
+            and price_a > 0 and price_b > 0
+        ):
+            try:
+                result = self.broker.open_pair(
+                    ticker_a=ticker_a,
+                    ticker_b=ticker_b,
+                    direction=side,
+                    notional=notional,
+                    price_a=float(price_a),
+                    price_b=float(price_b),
+                )
+                trade.broker = self.broker.name
+                trade.alpaca_order_ids = result.order_ids
+                if len(result.fills) >= 2:
+                    trade.qty_a = float(result.fills[0].qty)
+                    trade.qty_b = float(result.fills[1].qty)
+            except Exception as exc:
+                print(f"⚠️  Alpaca entry failed ({exc}); keeping sim journal fill only")
+
         self.current_trade = trade
         self.trades.append(trade)
         pair = f"{ticker_a}/{ticker_b}" if ticker_a and ticker_b else "PAIR"
-        print(f"\n🟢 OPENED Trade #{trade.trade_id} | {side} | {pair} [{basket}]")
+        print(f"\n🟢 OPENED Trade #{trade.trade_id} | {side} | {pair} [{basket}] | broker={trade.broker}")
         print(f"   Time: {time.date()} | z={z:.2f} | spread={spread:.3f} | notional=${notional:,.0f}")
 
     def close_trade(
@@ -1069,12 +1134,33 @@ class PaperTrader:
         else:
             t.pnl_z = t.entry_z - z
 
+        # Route exit to Alpaca paper when this bar is eligible
+        if self._should_route_to_broker(time) and t.broker.startswith("alpaca"):
+            try:
+                result = self.broker.close_pair(
+                    ticker_a=t.ticker_a,
+                    ticker_b=t.ticker_b,
+                    qty_a=t.qty_a,
+                    qty_b=t.qty_b,
+                    direction=t.direction,
+                )
+                ids = list(t.alpaca_order_ids or [])
+                ids.extend(result.order_ids)
+                t.alpaca_order_ids = ids
+            except Exception as exc:
+                print(f"⚠️  Alpaca exit failed ({exc})")
+
         # Dollar PnL: 1 z ≈ z_to_pct of notional, minus round-trip costs
+        # (Alpaca fills remain authoritative in the brokerage UI; journal keeps z-scaled $.)
         gross = t.pnl_z * z_to_pct * t.notional
         cost = t.notional * (self.cost_bps / 10_000.0)
         t.cost_dollars = float(cost)
         t.pnl_dollars = float(gross - cost)
         self.equity += t.pnl_dollars
+        if self.broker is not None:
+            eq = self.broker.get_equity()
+            if eq is not None and eq > 0:
+                self.equity = float(eq)
 
         pair = f"{t.ticker_a}/{t.ticker_b}" if t.ticker_a and t.ticker_b else "PAIR"
         print(f"🔴 CLOSED Trade #{t.trade_id} | {t.direction} | {pair}")
@@ -1237,6 +1323,8 @@ def _trade_pair_session(
                     ticker_b=pair.ticker_b,
                     basket=pair.basket,
                     risk_frac=0.08,
+                    price_a=float(row["price_a"]),
+                    price_b=float(row["price_b"]),
                 )
 
             elif z > 2.0 and conf > 0.55:
@@ -1258,6 +1346,8 @@ def _trade_pair_session(
                     ticker_b=pair.ticker_b,
                     basket=pair.basket,
                     risk_frac=0.08,
+                    price_a=float(row["price_a"]),
+                    price_b=float(row["price_b"]),
                 )
 
         # ---------- EXIT (rules + ML + half-life) ----------
@@ -1304,6 +1394,26 @@ def _trade_pair_session(
     return opened
 
 
+def build_broker(broker: str = "sim", dry_run: bool = False) -> Optional[AlpacaPaperBroker]:
+    """
+    broker: 'sim' | 'alpaca'
+    Always uses Alpaca *paper* endpoint when alpaca is selected.
+    """
+    mode = (broker or "sim").lower().strip()
+    if mode in ("sim", "none", "local"):
+        return None
+    if mode not in ("alpaca", "alpaca_paper", "paper"):
+        raise ValueError(f"Unknown broker '{broker}'. Use 'sim' or 'alpaca'.")
+    if dry_run:
+        return AlpacaPaperBroker(paper=True, dry_run=True)
+    if not alpaca_credentials_present():
+        raise RuntimeError(
+            "Alpaca broker requested but credentials are missing. "
+            "Set ALPACA_API_KEY and ALPACA_API_SECRET_KEY."
+        )
+    return AlpacaPaperBroker(paper=True, dry_run=False)
+
+
 def run_paper_trading_and_train(
     n_bars=600,
     min_trades=3,
@@ -1312,6 +1422,9 @@ def run_paper_trading_and_train(
     max_pairs_per_basket: int = 6,
     ml_threshold: float = 0.62,
     noise_model: KalmanNoiseModel | str = KalmanNoiseModel.STANDARD,
+    broker: str = "sim",
+    alpaca_latest_only: bool = True,
+    alpaca_dry_run: bool = False,
 ):
     print("Starting Paper Trading Session...")
     print("Goal: Complete at least", min_trades, "round-trip trades\n")
@@ -1363,8 +1476,22 @@ def run_paper_trading_and_train(
     else:
         print("ℹ️  No saved exit model yet — rule-only exits this session")
 
-    # 2–3. Adaptive Kalman filter + paper trader (ML-augmented exits when model present)
-    trader = PaperTrader()
+    # 2–3. Adaptive Kalman filter + paper trader (optional Alpaca paper brokerage)
+    broker_client = build_broker(broker, dry_run=alpaca_dry_run)
+    latest_bar = pd.Timestamp(prices.index.max())
+    if broker_client is not None:
+        print(
+            f"🏦 Broker: Alpaca PAPER "
+            f"(execute_latest_only={alpaca_latest_only}, dry_run={alpaca_dry_run})"
+        )
+    else:
+        print("📒 Broker: local simulator (no brokerage orders)")
+
+    trader = PaperTrader(
+        broker=broker_client,
+        execute_latest_only=alpaca_latest_only,
+        latest_bar=latest_bar,
+    )
     kf = AdaptiveKalmanPairs(delta=1e-4, R_base=1e-2, noise_model=noise_model)
     pair_frames: Dict[str, pd.DataFrame] = {}
     closed_count = 0
@@ -1448,6 +1575,22 @@ if __name__ == "__main__":
         default=KalmanNoiseModel.STANDARD.value,
         help="Kalman measurement-noise mode: standard | volume | parkinson",
     )
+    parser.add_argument(
+        "--broker",
+        choices=["sim", "alpaca"],
+        default="sim",
+        help="sim = local journal only; alpaca = route latest-bar fills to Alpaca paper",
+    )
+    parser.add_argument(
+        "--alpaca-all-bars",
+        action="store_true",
+        help="Submit Alpaca paper orders for every simulated fill (dangerous; default is latest bar only)",
+    )
+    parser.add_argument(
+        "--alpaca-dry-run",
+        action="store_true",
+        help="Build Alpaca order payloads without calling the API (for tests)",
+    )
     args = parser.parse_args()
 
     if args.train_only:
@@ -1461,6 +1604,9 @@ if __name__ == "__main__":
             include_cross=True,
             ml_threshold=args.ml_threshold,
             noise_model=args.noise_model,
+            broker=args.broker,
+            alpaca_latest_only=not args.alpaca_all_bars,
+            alpaca_dry_run=args.alpaca_dry_run,
         )
 
         if model is None:

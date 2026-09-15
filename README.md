@@ -6,11 +6,21 @@ Paper trading + ML exit trainer for **Mag7 / semis / memory / hyperscaler** pair
 
 ```bash
 pip install -r requirements.txt
-python paper_trading_ml_exit.py
-python paper_trading_ml_exit.py --noise-model volume      # volume-adjusted R
-python paper_trading_ml_exit.py --noise-model parkinson   # Parkinson high-low R
-python paper_trading_ml_exit.py --train-only   # retrain from results/
+python paper_trading_ml_exit.py                          # local sim journal
+python paper_trading_ml_exit.py --broker alpaca          # Alpaca *paper* for latest-bar fills
+python paper_trading_ml_exit.py --noise-model volume
+python paper_trading_ml_exit.py --train-only
 ```
+
+**Brokerage:** default is a local simulator. With `--broker alpaca`, entry/exit on the **latest bar only** are submitted to the Alpaca **paper** API (never live). Set:
+
+```bash
+export ALPACA_API_KEY=...
+export ALPACA_API_SECRET_KEY=...
+# (aliases APCA_API_KEY_ID / APCA_API_SECRET_KEY also work)
+```
+
+Historical bars still drive Kalman / ML training in-process; only the most recent signal date is routed to Alpaca so replay does not spam orders.
 
 **Data:** per-ticker OHLCV from **yfinance only** (no synthetic). Each ticker panel includes Open/High/Low/Close/Volume; High/Low/Volume feed adaptive Kalman R modes. Trade windows and training samples are restricted to the **latest calendar year** (e.g. 2026) — prior years like 2025 are excluded.
 
