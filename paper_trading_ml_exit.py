@@ -874,6 +874,56 @@ class PaperTrader:
 # MAIN PAPER TRADING + TRAINING LOOP
 # ============================================================
 
+def should_exit_with_ml(
+    position: int,
+    z: float,
+    bars_held: int,
+    features: np.ndarray,
+    model: Optional[LogisticExitModel],
+    ml_threshold: float = 0.62,
+    force_rules: bool = True,
+) -> Tuple[bool, Optional[float]]:
+    """
+    Combine classic mean-reversion / time / stop rules with ML probability.
+
+    Returns
+    -------
+    (should_exit, ml_proba)
+    """
+    # ----- Classic safety rules (always available) -----
+    rule_exit = False
+    if position == 1 and z > -0.35:
+        rule_exit = True
+    if position == -1 and z < 0.35:
+        rule_exit = True
+    if bars_held >= 28:                     # hard time stop
+        rule_exit = True
+    if position == 1 and z < -3.6:          # adverse stop
+        rule_exit = True
+    if position == -1 and z > 3.6:
+        rule_exit = True
+
+    ml_proba = None
+    if model is not None and model.weights is not None:
+        try:
+            ml_proba = float(model.predict_proba(features.reshape(1, -1))[0])
+        except Exception:
+            ml_proba = None
+
+    # ----- ML override / reinforcement -----
+    if ml_proba is not None:
+        # High probability → force exit even if rules have not triggered yet
+        if ml_proba >= ml_threshold:
+            return True, ml_proba
+        # Low probability → optionally suppress a soft rule exit
+        # (keep hard stops & time stop)
+        if force_rules and ml_proba < 0.38 and bars_held < 22:
+            if abs(z) < 2.8:          # only suppress mild mean-reversion exits
+                return False, ml_proba
+
+    return rule_exit, ml_proba
+
+
 def _trade_pair_session(
     trader: PaperTrader,
     df: pd.DataFrame,
@@ -881,30 +931,29 @@ def _trade_pair_session(
     min_trades: int,
     trades_remaining: int,
     trade_year: Optional[int] = None,
+    model: Optional[LogisticExitModel] = None,
+    ml_threshold: float = 0.62,
 ) -> int:
-    """Run rule-based entries/exits on one pair; return number of new closed trades.
-
-    Entries are allowed only in `trade_year` (latest calendar year). Prior-year
-    bars may exist for indicator warm-up but never open a 2025 (or older) window.
-    While in a position, richer Kalman/path exit features are computed each bar
-    (ready for ML-driven exits).
-    """
+    """Run entries + ML-augmented exits on one pair."""
     position = 0
     entry_idx = 0
     opened = 0
     pos_state = PositionState()
+
     if trade_year is None:
         trade_year = int(pd.Timestamp(df.index.max()).year)
 
     for i in range(60, len(df)):
         if opened >= trades_remaining:
             break
+
         row = df.iloc[i]
-        z = row["zscore"]
-        conf = row["confidence"]
+        z = float(row["zscore"])
+        conf = float(row.get("confidence", 0.5))
         time = df.index[i]
         in_trade_year = int(pd.Timestamp(time).year) == int(trade_year)
 
+        # ---------- ENTRY ----------
         if position == 0:
             if not in_trade_year:
                 continue
@@ -913,7 +962,7 @@ def _trade_pair_session(
                 entry_idx = i
                 pos_state = PositionState(
                     direction=1,
-                    entry_z=float(z),
+                    entry_z=z,
                     entry_bar=i,
                     entry_spread=float(row["spread"]),
                     highest_favorable_z=0.0,
@@ -927,7 +976,7 @@ def _trade_pair_session(
                 entry_idx = i
                 pos_state = PositionState(
                     direction=-1,
-                    entry_z=float(z),
+                    entry_z=z,
                     entry_bar=i,
                     entry_spread=float(row["spread"]),
                     highest_favorable_z=0.0,
@@ -936,31 +985,23 @@ def _trade_pair_session(
                     -1, time, z, row["spread"],
                     ticker_a=pair.ticker_a, ticker_b=pair.ticker_b, basket=pair.basket,
                 )
+
+        # ---------- EXIT (ML + rules) ----------
         elif position != 0:
-            bars_held = i - pos_state.entry_bar
+            bars_held = i - entry_idx
             pos_state.bars_held = bars_held
             features = extract_exit_features(pos_state, row, bars_held, position)
-            should_exit = False
 
-            if position == 1 and z > -0.4:
-                should_exit = True
-            if position == -1 and z < 0.4:
-                should_exit = True
-            if bars_held > 25:
-                should_exit = True
-            if position == 1 and z < -3.5:
-                should_exit = True
-            if position == -1 and z > 3.5:
-                should_exit = True
+            should_exit, ml_proba = should_exit_with_ml(
+                position=position,
+                z=z,
+                bars_held=bars_held,
+                features=features,
+                model=model,
+                ml_threshold=ml_threshold,
+            )
 
             if should_exit:
-                # Soft exit score from live features (pnl_proxy + confidence);
-                # swap for LogisticExitModel.predict_proba when a trained model
-                # is passed into the session.
-                ml_proba = float(
-                    1.0 / (1.0 + np.exp(-(0.8 * features[2] + 0.5 * (features[4] - 0.5))))
-                )
-                ml_proba = float(np.clip(ml_proba, 0.05, 0.95))
                 trader.close_trade(
                     time, z, row["spread"],
                     ml_proba=ml_proba,
@@ -980,6 +1021,7 @@ def run_paper_trading_and_train(
     baskets: Optional[Sequence[str]] = None,
     include_cross: bool = True,
     max_pairs_per_basket: int = 6,
+    ml_threshold: float = 0.62,
 ):
     print("Starting Paper Trading Session...")
     print("Goal: Complete at least", min_trades, "round-trip trades\n")
@@ -1000,7 +1042,18 @@ def run_paper_trading_and_train(
     print(f"\nPrice panel: {prices.shape[1]} tickers × {prices.shape[0]} bars  [source: {data_source}]")
     print(f"Trade windows: {trade_year} only (no prior-year entries)\n")
 
-    # 2–3. Adaptive Kalman filter + paper trader
+    # Try to load a previously trained model (rule-only if missing)
+    model = None
+    if MODEL_JSON.exists():
+        try:
+            model = LogisticExitModel.load(MODEL_JSON)
+            print(f"✅ Loaded existing exit model from {MODEL_JSON}")
+        except Exception as e:
+            print(f"⚠️ Could not load model ({e}); running rule-only this session")
+    else:
+        print("ℹ️  No saved exit model yet — rule-only exits this session")
+
+    # 2–3. Adaptive Kalman filter + paper trader (ML-augmented exits when model present)
     trader = PaperTrader()
     kf = AdaptiveKalmanPairs(delta=1e-4, R=1e-2)
     pair_frames: Dict[str, pd.DataFrame] = {}
@@ -1011,17 +1064,20 @@ def run_paper_trading_and_train(
             break
         if pair.ticker_a not in prices.columns or pair.ticker_b not in prices.columns:
             continue
+
         price_a = prices[pair.ticker_a]
         price_b = prices[pair.ticker_b]
         df = kf.filter_pair(price_a, price_b)
         pair_frames[pair.label] = df
+
         print(f"\n--- Scanning {pair.label} [{pair.basket}] (year={trade_year}) ---")
-        # At most one round-trip per pair so we rotate across Mag7 / semis / memory / hyperscaler
         opened = _trade_pair_session(
             trader, df, pair,
             min_trades=min_trades,
             trades_remaining=1,
             trade_year=trade_year,
+            model=model,
+            ml_threshold=ml_threshold,
         )
         closed_count += opened
 
@@ -1046,6 +1102,7 @@ def run_paper_trading_and_train(
 
     return trader, model, df_out
 
+
 # ============================================================
 # RUN IT
 # ============================================================
@@ -1060,6 +1117,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--n-bars", type=int, default=700)
     parser.add_argument("--min-trades", type=int, default=4)
+    parser.add_argument(
+        "--ml-threshold",
+        type=float,
+        default=0.62,
+        help="ML exit probability threshold for forced exits (default 0.62)",
+    )
     args = parser.parse_args()
 
     if args.train_only:
@@ -1071,6 +1134,7 @@ if __name__ == "__main__":
             min_trades=args.min_trades,
             baskets=["mag7", "semis", "memory", "hyperscaler"],
             include_cross=True,
+            ml_threshold=args.ml_threshold,
         )
 
         if model is None:

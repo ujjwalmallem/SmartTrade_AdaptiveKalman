@@ -89,6 +89,54 @@ class TestExitFeatures(unittest.TestCase):
         self.assertTrue(np.isfinite(feat).all())
 
 
+class TestShouldExitWithML(unittest.TestCase):
+    def _features(self, pnl=0.5, conf=0.7):
+        # Aligns with FEATURE_NAMES length
+        feat = np.zeros(len(m.FEATURE_NAMES))
+        feat[2] = pnl
+        feat[4] = conf
+        return feat
+
+    def test_rule_exit_without_model(self):
+        should, proba = m.should_exit_with_ml(
+            position=1, z=-0.2, bars_held=5,
+            features=self._features(), model=None,
+        )
+        self.assertTrue(should)
+        self.assertIsNone(proba)
+
+    def test_hard_time_stop(self):
+        should, _ = m.should_exit_with_ml(
+            position=1, z=-1.5, bars_held=28,
+            features=self._features(), model=None,
+        )
+        self.assertTrue(should)
+
+    def test_ml_force_exit(self):
+        model = m.LogisticExitModel()
+        # Craft weights so predict_proba is high for any finite feature vector
+        model.weights = np.zeros(len(m.FEATURE_NAMES))
+        model.bias = 3.0  # sigmoid(3) ≈ 0.95
+        should, proba = m.should_exit_with_ml(
+            position=1, z=-1.5, bars_held=3,
+            features=self._features(), model=model, ml_threshold=0.62,
+        )
+        self.assertTrue(should)
+        self.assertIsNotNone(proba)
+        self.assertGreaterEqual(proba, 0.62)
+
+    def test_ml_suppresses_soft_rule_exit(self):
+        model = m.LogisticExitModel()
+        model.weights = np.zeros(len(m.FEATURE_NAMES))
+        model.bias = -3.0  # sigmoid(-3) ≈ 0.05
+        should, proba = m.should_exit_with_ml(
+            position=1, z=-0.2, bars_held=5,  # would be soft rule exit
+            features=self._features(), model=model, ml_threshold=0.62,
+        )
+        self.assertFalse(should)
+        self.assertLess(proba, 0.38)
+
+
 class TestLatestYearFilter(unittest.TestCase):
     def test_filter_drops_2025_keeps_2026(self):
         df = pd.DataFrame({
