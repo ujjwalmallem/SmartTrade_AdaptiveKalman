@@ -1340,18 +1340,28 @@ def _trade_pair_session(
     trade_year: Optional[int] = None,
     model: Optional[LogisticExitModel] = None,
     ml_threshold: float = 0.62,
+    mode: str = "backtest",
+    latest_bar: Optional[pd.Timestamp] = None,
 ) -> int:
     """
     Run rule-based entries + ML-augmented exits on one pair.
     Returns the number of newly closed trades.
 
-    Wires Adaptive Kalman features (incl. half-life), ML exit probability,
-    exact live feature logging, and cost-aware dollar PnL on close.
+    mode:
+      - backtest: scan the full trade-year window (builds ML journal; sim fills)
+      - live: warm Kalman on history, enter/exit only on the latest bar
+              (this is what places Alpaca paper orders with --broker alpaca)
     """
     position = 0
     entry_idx = 0
     opened = 0
     pos_state = PositionState()
+    live = (mode or "backtest").lower().strip() == "live"
+    latest_norm = (
+        pd.Timestamp(latest_bar).normalize()
+        if latest_bar is not None
+        else pd.Timestamp(df.index.max()).normalize()
+    )
 
     if trade_year is None:
         trade_year = int(pd.Timestamp(df.index.max()).year)
@@ -1365,10 +1375,14 @@ def _trade_pair_session(
         conf = float(row.get("confidence", 0.5))
         time = df.index[i]
         in_trade_year = int(pd.Timestamp(time).year) == int(trade_year)
+        is_latest = pd.Timestamp(time).normalize() == latest_norm
 
         # ---------- ENTRY ----------
         if position == 0:
             if not in_trade_year:
+                continue
+            # Live mode: ignore historical entry signals; only act on freshest bar
+            if live and not is_latest:
                 continue
 
             # Classic z-score entry with confidence filter
@@ -1420,6 +1434,10 @@ def _trade_pair_session(
 
         # ---------- EXIT (rules + ML + half-life) ----------
         elif position != 0:
+            # Live mode only manages the position on the latest bar
+            if live and not is_latest:
+                continue
+
             bars_held = i - entry_idx
             pos_state.bars_held = bars_held
 
@@ -1494,9 +1512,20 @@ def run_paper_trading_and_train(
     alpaca_latest_only: bool = True,
     alpaca_dry_run: bool = False,
     data_source: str = "auto",
+    mode: str = "backtest",
 ):
+    mode = (mode or "backtest").lower().strip()
+    if mode not in ("backtest", "live"):
+        raise ValueError("mode must be 'backtest' or 'live'")
+
     print("Starting Paper Trading Session...")
-    print("Goal: Complete at least", min_trades, "round-trip trades\n")
+    print(f"Mode: {mode}")
+    if mode == "live":
+        print("Live: fresh OHLCV → Kalman warm-up → act only on the latest bar")
+        print("Goal: today's signal only (0 trades is OK if no ±2 z setup)\n")
+    else:
+        print("Backtest: replay history for the ML journal (Alpaca orders only if a fill hits latest bar)")
+        print("Goal: Complete at least", min_trades, "round-trip trades\n")
 
     # 0. Universe — Mag7, semis, memory, hyperscaler
     baskets = list(baskets) if baskets is not None else list(TICKER_UNIVERSES.keys())
@@ -1550,10 +1579,13 @@ def run_paper_trading_and_train(
     # 2–3. Adaptive Kalman filter + paper trader (optional Alpaca paper brokerage)
     broker_client = build_broker(broker, dry_run=alpaca_dry_run)
     latest_bar = pd.Timestamp(prices.index.max())
+    if mode == "live":
+        alpaca_latest_only = True
     if broker_client is not None:
         print(
             f"🏦 Broker: Alpaca PAPER "
-            f"(execute_latest_only={alpaca_latest_only}, dry_run={alpaca_dry_run})"
+            f"(mode={mode}, execute_latest_only={alpaca_latest_only}, "
+            f"latest_bar={latest_bar.date()}, dry_run={alpaca_dry_run})"
         )
     else:
         print("📒 Broker: local simulator (no brokerage orders)")
@@ -1591,10 +1623,12 @@ def run_paper_trading_and_train(
         opened = _trade_pair_session(
             trader, df, pair,
             min_trades=min_trades,
-            trades_remaining=1,
+            trades_remaining=(1 if mode == "backtest" else max(1, min_trades - closed_count)),
             trade_year=trade_year,
             model=model,
             ml_threshold=ml_threshold,
+            mode=mode,
+            latest_bar=latest_bar,
         )
         closed_count += opened
 
@@ -1609,6 +1643,14 @@ def run_paper_trading_and_train(
     df_out = next(iter(pair_frames.values())) if pair_frames else prices
 
     if len(closed_trades) < 2:
+        if mode == "live":
+            print(
+                "Live session: fewer than 2 closed trades (no/insufficient latest-bar signals). "
+                "Broker orders are still placed when a latest-bar entry/exit fires."
+            )
+            if closed_trades:
+                save_paper_results(closed_trades, data_source=data_source)
+            return trader, None, df_out
         print("Not enough trades generated. Try increasing n_bars or relaxing entry thresholds.")
         return trader, None, df_out
 
@@ -1647,6 +1689,12 @@ if __name__ == "__main__":
         help="Kalman measurement-noise mode: standard | volume | parkinson",
     )
     parser.add_argument(
+        "--mode",
+        choices=["backtest", "live"],
+        default="backtest",
+        help="backtest=replay history for ML journal; live=act only on latest bar (Alpaca paper)",
+    )
+    parser.add_argument(
         "--data-source",
         choices=["auto", "alpaca", "yfinance"],
         default="auto",
@@ -1670,6 +1718,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    if args.mode == "live" and args.broker == "sim":
+        print("ℹ️  Live mode with --broker sim will not place Alpaca orders. Use --broker alpaca.")
+
     if args.train_only:
         model = train_from_stored_results()
         print("\n🎯 Retrain complete from stored results.")
@@ -1685,6 +1736,7 @@ if __name__ == "__main__":
             alpaca_latest_only=not args.alpaca_all_bars,
             alpaca_dry_run=args.alpaca_dry_run,
             data_source=args.data_source,
+            mode=args.mode,
         )
 
         if model is None:

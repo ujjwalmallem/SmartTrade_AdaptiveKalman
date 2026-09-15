@@ -6,10 +6,10 @@ Paper trading + ML exit trainer for **Mag7 / semis / memory / hyperscaler** pair
 
 ```bash
 pip install -r requirements.txt
-python paper_trading_ml_exit.py                          # Alpaca data (auto) + local sim journal
-python paper_trading_ml_exit.py --data-source auto       # Alpaca primary, yfinance backup
-python paper_trading_ml_exit.py --data-source yfinance   # force Yahoo backup
-python paper_trading_ml_exit.py --broker alpaca          # Alpaca *paper* for latest-bar fills
+python paper_trading_ml_exit.py --mode backtest --broker sim   # replay history → ML journal
+python paper_trading_ml_exit.py --mode live --broker alpaca    # fresh data → latest-bar Alpaca paper orders
+python paper_trading_ml_exit.py --data-source auto             # Alpaca primary, yfinance backup
+python paper_trading_ml_exit.py --data-source yfinance         # force Yahoo backup
 python paper_trading_ml_exit.py --noise-model volume
 python paper_trading_ml_exit.py --train-only
 ```
@@ -22,7 +22,9 @@ python paper_trading_ml_exit.py --train-only
 2. Add exactly these names (paper keys only — never live keys):
    - `ALPACA_API_KEY`
    - `ALPACA_API_SECRET_KEY`
-3. Push or run **Paper Trading CI** (`workflow_dispatch`). If both secrets exist, CI runs `--broker alpaca`; otherwise it falls back to `--broker sim`.
+3. CI (with GitHub Secrets) runs two steps when Alpaca keys exist:
+   1. `--mode backtest --broker sim` → builds the ML journal from history
+   2. `--mode live --broker alpaca` → places paper orders only if today's latest bar has a signal
 
 Do **not** put keys in the repo, `.env` commits, workflow logs, or PR text.
 

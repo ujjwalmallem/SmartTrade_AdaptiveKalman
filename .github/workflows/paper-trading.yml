@@ -61,12 +61,15 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "${ALPACA_API_KEY:-}" ] && [ -n "${ALPACA_API_SECRET_KEY:-}" ]; then
-            echo "🏦 Alpaca secrets present — paper brokerage for latest-bar fills"
-            python paper_trading_ml_exit.py --broker alpaca --data-source auto
+            echo "🏦 Alpaca secrets present"
+            echo "--- (1/2) Backtest journal for ML (sim fills, Alpaca OHLCV) ---"
+            python paper_trading_ml_exit.py --mode backtest --broker sim --data-source auto --min-trades 4
+            echo "--- (2/2) Live: act on latest bar only → Alpaca PAPER orders ---"
+            python paper_trading_ml_exit.py --mode live --broker alpaca --data-source auto --min-trades 1
           else
-            echo "📒 No Alpaca secrets — local simulator only"
+            echo "📒 No Alpaca secrets — backtest simulator only"
             echo "   Add ALPACA_API_KEY and ALPACA_API_SECRET_KEY under Repo Settings → Secrets"
-            python paper_trading_ml_exit.py --broker sim --data-source auto
+            python paper_trading_ml_exit.py --mode backtest --broker sim --data-source auto
           fi
 
       - name: Retrain from stored results

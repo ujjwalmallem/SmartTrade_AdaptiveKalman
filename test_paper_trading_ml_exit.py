@@ -356,6 +356,33 @@ class TestEndToEndYfinance(unittest.TestCase):
 
 
 
+
+class TestLiveMode(unittest.TestCase):
+    def test_live_mode_only_enters_on_latest_bar(self):
+        idx = pd.date_range("2026-01-02", periods=120, freq="B")
+        rng = np.random.default_rng(0)
+        z = rng.normal(0, 0.5, len(idx))
+        z[70] = -2.5
+        z[-1] = -2.4
+        df = pd.DataFrame({
+            "zscore": z,
+            "confidence": np.full(len(idx), 0.7),
+            "spread": np.cumsum(rng.normal(0, 0.2, len(idx))),
+            "spread_velocity": 0.0,
+            "spread_vol": 1.0,
+            "price_a": 100 + np.arange(len(idx)) * 0.1,
+            "price_b": 200 + np.arange(len(idx)) * 0.05,
+        }, index=idx)
+        pair = m.PairSpec(ticker_a="AAPL", ticker_b="MSFT", basket="mag7")
+        trader = m.PaperTrader()
+        m._trade_pair_session(
+            trader, df, pair, min_trades=1, trades_remaining=1,
+            trade_year=2026, mode="live", latest_bar=idx[-1],
+        )
+        self.assertGreaterEqual(len(trader.trades), 1)
+        for tr in trader.trades:
+            self.assertEqual(pd.Timestamp(tr.entry_time).normalize(), pd.Timestamp(idx[-1]).normalize())
+
 class TestAlpacaDataPrimary(unittest.TestCase):
     def test_alpaca_primary_path_with_mock(self):
         import types
