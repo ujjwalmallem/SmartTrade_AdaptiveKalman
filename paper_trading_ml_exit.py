@@ -883,6 +883,37 @@ def closed_trades_to_frame(
     return pd.DataFrame(rows)
 
 
+def _trade_fingerprint_cols() -> List[str]:
+    return ["ticker_a", "ticker_b", "direction", "entry_time", "exit_time", "broker"]
+
+
+def dedupe_journal_rows(journal: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop repeated sim backtest replays (same pair/entry/exit/broker).
+    Keep alpaca_* rows intact (including OPEN with null exit_time).
+    """
+    if journal is None or journal.empty:
+        return journal
+    df = journal.copy()
+    for col in ("entry_time", "exit_time"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], format="mixed", errors="coerce")
+    broker = df["broker"].astype(str) if "broker" in df.columns else pd.Series([""] * len(df))
+    is_sim = broker.str.lower().isin(["sim", "none", "local", ""])
+    cols = [c for c in _trade_fingerprint_cols() if c in df.columns]
+    if not cols:
+        return df
+    sim = df.loc[is_sim]
+    other = df.loc[~is_sim]
+    if not sim.empty:
+        sim = sim.drop_duplicates(subset=cols, keep="last")
+    out = pd.concat([sim, other], ignore_index=True)
+    sort_cols = [c for c in ("entry_time", "run_id", "trade_id") if c in out.columns]
+    if sort_cols:
+        out = out.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+    return out
+
+
 def save_paper_results(
     closed_trades: Sequence[PaperTrade],
     results_dir: Optional[Path] = None,
@@ -892,6 +923,7 @@ def save_paper_results(
     """
     Append closed trades to a journal CSV and write/append the training dataset.
     Prior-year windows (e.g. 2025) are purged so only the latest year remains.
+    Repeated sim backtest rows (same pair/entry/exit) are deduped.
     Returns (trades_csv_path, dataset_csv_path).
     """
     results_dir = Path(results_dir) if results_dir is not None else RESULTS_DIR
@@ -903,13 +935,14 @@ def save_paper_results(
     trades_path = results_dir / "paper_trades.csv"
     dataset_path = results_dir / "exit_training_dataset.csv"
 
-    # Full journal (append, then keep latest year only)
+    # Full journal (append, then keep latest year only, then dedupe sim replays)
     if trades_path.exists():
         prev = pd.read_csv(trades_path)
         journal = pd.concat([prev, frame], ignore_index=True)
     else:
         journal = frame
     journal = filter_trades_to_latest_year(journal, trade_year=year)
+    journal = dedupe_journal_rows(journal)
     journal.to_csv(trades_path, index=False)
 
     # Training dataset = feature columns + label (closed trades only)
@@ -1196,9 +1229,13 @@ class PaperTrader:
         features: Optional[np.ndarray] = None,
         bars_held: Optional[int] = None,
         z_to_pct: float = 0.01,
-    ):
+    ) -> bool:
+        """
+        Close the current trade. Returns True if the journal marks CLOSED.
+        Returns False if there is no open trade, or Alpaca exit failed (stays OPEN).
+        """
         if self.current_trade is None:
-            return
+            return False
 
         t = self.current_trade
         t.exit_time = time
@@ -1231,7 +1268,18 @@ class PaperTrader:
                 ids.extend(result.order_ids)
                 t.alpaca_order_ids = ids
             except Exception as exc:
-                print(f"⚠️  Alpaca exit failed ({exc})")
+                # Keep journal OPEN so it still matches brokerage exposure
+                print(f"⚠️  Alpaca exit failed ({exc}); leaving trade OPEN in journal")
+                t.status = "OPEN"
+                t.exit_time = None
+                t.exit_z = None
+                t.exit_spread = None
+                t.pnl_z = None
+                t.pnl_dollars = None
+                t.cost_dollars = None
+                t.ml_proba_at_exit = None
+                t.exit_features = None
+                return False
 
         # Dollar PnL: 1 z ≈ z_to_pct of notional, minus round-trip costs
         # (Alpaca fills remain authoritative in the brokerage UI; journal keeps z-scaled $.)
@@ -1255,6 +1303,7 @@ class PaperTrader:
             print(f"   ML Exit Prob at close: {ml_proba:.2%}")
 
         self.current_trade = None
+        return True
 
     def summary(self):
         closed = [t for t in self.trades if t.status == "CLOSED"]
@@ -1372,6 +1421,8 @@ def _trade_pair_session(
     opened = 0
     pos_state = PositionState()
     live = (mode or "backtest").lower().strip() == "live"
+    # Fresh Alpaca entries hold overnight; adopted exposure may still exit today.
+    fresh_entry_this_bar = False
     latest_norm = (
         pd.Timestamp(latest_bar).normalize()
         if latest_bar is not None
@@ -1391,6 +1442,7 @@ def _trade_pair_session(
         time = df.index[i]
         in_trade_year = int(pd.Timestamp(time).year) == int(trade_year)
         is_latest = pd.Timestamp(time).normalize() == latest_norm
+        fresh_entry_this_bar = False
 
         # ---------- ENTRY ----------
         if position == 0:
@@ -1470,6 +1522,8 @@ def _trade_pair_session(
                 )
                 if len(trader.trades) == before_n:
                     position = 0  # broker refused (e.g. existing exposure)
+                else:
+                    fresh_entry_this_bar = True
 
             elif position == 0 and z > 2.0 and conf > 0.55:
                 position = -1
@@ -1496,6 +1550,8 @@ def _trade_pair_session(
                 )
                 if len(trader.trades) == before_n:
                     position = 0
+                else:
+                    fresh_entry_this_bar = True
 
         # ---------- EXIT (rules + ML + half-life) ----------
         # Use `if` (not elif) so a just-adopted live position can exit this bar
@@ -1503,6 +1559,14 @@ def _trade_pair_session(
             # Live mode only manages the position on the latest bar
             if live and not is_latest:
                 continue
+            # Live: never exit on the same bar we just entered (avoids wash trades
+            # and overnight-hold semantics). Adopted exposure may still exit.
+            if live and fresh_entry_this_bar:
+                print(
+                    f"ℹ️  Live hold overnight on {pair.label} "
+                    f"(entered this bar; exit evaluated on next run)"
+                )
+                break
 
             bars_held = i - entry_idx
             pos_state.bars_held = bars_held
@@ -1529,7 +1593,7 @@ def _trade_pair_session(
             )
 
             if should_exit:
-                trader.close_trade(
+                did_close = trader.close_trade(
                     time=time,
                     z=z,
                     spread=row["spread"],
@@ -1537,6 +1601,9 @@ def _trade_pair_session(
                     features=features,  # exact vector stored on the trade
                     bars_held=bars_held,  # bar count (not calendar days)
                 )
+                if not did_close:
+                    # Broker still holding — stop managing this pair this run
+                    break
                 position = 0
                 opened += 1
 
