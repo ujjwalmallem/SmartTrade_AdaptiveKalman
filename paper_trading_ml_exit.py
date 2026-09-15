@@ -951,7 +951,15 @@ def save_paper_results(
     if "status" in closed_frame.columns:
         closed_frame = closed_frame[closed_frame["status"].fillna("CLOSED") == "CLOSED"]
     closed_frame = closed_frame.dropna(subset=["label"]) if "label" in closed_frame.columns else closed_frame
-    ds = closed_frame[["run_id", "data_source", "trade_id", "ticker_a", "ticker_b", "basket", *feat_cols, "label"]]
+    # OPEN-only saves (live adopt / overnight hold) have no feat_* columns yet
+    for col in feat_cols:
+        if col not in closed_frame.columns:
+            closed_frame[col] = np.nan
+    want_cols = ["run_id", "data_source", "trade_id", "ticker_a", "ticker_b", "basket", *feat_cols, "label"]
+    for col in want_cols:
+        if col not in closed_frame.columns:
+            closed_frame[col] = np.nan
+    ds = closed_frame[want_cols]
     # Drop rows missing any feature (e.g. open broker mirrors)
     ds = ds.dropna(subset=feat_cols, how="any")
     if dataset_path.exists():

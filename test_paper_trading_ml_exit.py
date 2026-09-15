@@ -487,6 +487,31 @@ class TestLiveMode(unittest.TestCase):
         self.assertEqual(len(sim_rows), 1)
         self.assertEqual(len(alpaca_rows), 2)
 
+    def test_save_open_only_trades_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            trade = m.PaperTrade(
+                trade_id=1,
+                direction="SHORT_SPREAD",
+                entry_time=pd.Timestamp("2026-09-15"),
+                entry_z=2.2,
+                entry_spread=1.0,
+                ticker_a="QCOM",
+                ticker_b="AVGO",
+                basket="semis",
+                broker="alpaca_paper",
+                qty_a=21.0,
+                qty_b=11.0,
+                status="OPEN",
+            )
+            path, ds_path = m.save_paper_results([trade], results_dir=tmp_path, data_source="alpaca_live")
+            journal = pd.read_csv(path)
+            self.assertEqual(len(journal), 1)
+            self.assertEqual(journal.iloc[0]["status"], "OPEN")
+            self.assertEqual(journal.iloc[0]["broker"], "alpaca_paper")
+            self.assertTrue(ds_path.exists())
+            self.assertEqual(len(pd.read_csv(ds_path)), 0)
+
 class TestAlpacaDataPrimary(unittest.TestCase):
     def test_alpaca_primary_path_with_mock(self):
         import types

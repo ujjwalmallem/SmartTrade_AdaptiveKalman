@@ -120,5 +120,10 @@ jobs:
             echo "No changes to persist."
           else
             git commit -m "Update accumulated paper-trading results"
-            git push origin HEAD:results-data
+            # Concurrent push/PR workflows can race on results-data; retry once.
+            if ! git push origin HEAD:results-data; then
+              git fetch --depth=1 origin results-data
+              git rebase origin/results-data || git rebase --abort
+              git push origin HEAD:results-data
+            fi
           fi
