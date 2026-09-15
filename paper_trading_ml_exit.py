@@ -25,6 +25,7 @@ MODEL_JSON = RESULTS_DIR / "logistic_exit_model.json"
 FEATURE_NAMES = [
     "entry_z", "abs_entry_z", "pnl_proxy", "bars_held", "confidence",
     "velocity", "exit_z", "favorable", "best_fav", "vol",
+    "half_life",
 ]
 
 # ============================================================
@@ -657,50 +658,75 @@ def analyze_feature_importance(model, feature_names):
 # RESULTS STORAGE + TRAINING FROM HISTORY
 # ============================================================
 
+def estimate_half_life(spread: pd.Series, lookback: int = 40) -> float:
+    """
+    Ornstein-Uhlenbeck style half-life (in bars).
+    Returns a large number when the spread is not mean-reverting.
+    """
+    if len(spread) < lookback + 5:
+        return 30.0
+    s = spread.iloc[-lookback:].astype(float)
+    lag = s.shift(1).dropna()
+    delta = s.diff().dropna()
+    n = min(len(lag), len(delta))
+    if n < 10:
+        return 30.0
+    lag = lag.iloc[-n:]
+    delta = delta.iloc[-n:]
+    if float(lag.std()) < 1e-8:
+        return 30.0
+    beta = float(np.polyfit(lag.values, delta.values, 1)[0])
+    if beta >= 0:
+        return 60.0  # not mean-reverting
+    hl = np.log(2) / abs(beta)
+    return float(np.clip(hl, 2.0, 60.0))
+
+
 def extract_exit_features(
     position: PositionState,
     row: pd.Series,
     bars_held: int,
     direction: int,
+    half_life: float = 20.0,
 ) -> np.ndarray:
     """
-    Build the 10-dimensional feature vector used by LogisticExitModel.
-    All values are computed from live Kalman state + path statistics.
+    Build the feature vector used by LogisticExitModel.
+    Includes OU half-life as a mean-reversion strength signal.
     Order matches FEATURE_NAMES.
     """
     z = float(row["zscore"])
     conf = float(row.get("confidence", 0.5))
     vel = float(row.get("spread_velocity", 0.0))
     vol = float(row.get("spread_vol", 1.0))
+    hl = float(half_life)
 
-    # Current PnL in z-space (positive = favorable)
-    if direction == 1:          # long the spread
+    # Dynamic confidence: trust prints more when half-life is short
+    conf = float(np.clip(conf * (30.0 / (30.0 + hl)), 0.05, 0.99))
+
+    if direction == 1:
         pnl_proxy = z - position.entry_z
         favorable = max(0.0, z - position.entry_z)
-    else:                       # short the spread
+    else:
         pnl_proxy = position.entry_z - z
         favorable = max(0.0, position.entry_z - z)
 
-    # Track best favorable excursion
     position.highest_favorable_z = max(position.highest_favorable_z, favorable)
     best_fav = position.highest_favorable_z
-
-    # Normalized bars held (0–1-ish scale)
     bars_norm = bars_held / 30.0
 
-    feat = np.array([
-        position.entry_z,           # 0 entry_z
-        abs(position.entry_z),      # 1 abs_entry_z
-        pnl_proxy,                  # 2 pnl_proxy
-        bars_norm,                  # 3 bars_held
-        conf,                       # 4 confidence
-        vel,                        # 5 velocity
-        z,                          # 6 exit_z (current)
-        favorable,                  # 7 favorable (current)
-        best_fav,                   # 8 best_fav
-        vol,                        # 9 vol
+    return np.array([
+        position.entry_z,
+        abs(position.entry_z),
+        pnl_proxy,
+        bars_norm,
+        conf,
+        vel,
+        z,
+        favorable,
+        best_fav,
+        vol,
+        hl / 30.0,
     ], dtype=float)
-    return feat
 
 
 def trade_to_features(t: "PaperTrade") -> np.ndarray:
@@ -709,10 +735,14 @@ def trade_to_features(t: "PaperTrade") -> np.ndarray:
     Fall back to a reconstructed approximation only if missing
     (e.g. legacy journal rows).
     """
-    if t.exit_features is not None and len(t.exit_features) == len(FEATURE_NAMES):
-        return np.asarray(t.exit_features, dtype=float)
+    if t.exit_features is not None:
+        vec = np.asarray(t.exit_features, dtype=float).ravel()
+        if len(vec) == len(FEATURE_NAMES):
+            return vec
+        # Pad legacy 10-d vectors with a neutral half-life feature
+        if len(vec) == len(FEATURE_NAMES) - 1:
+            return np.concatenate([vec, [20.0 / 30.0]])
 
-    # ---------- fallback reconstruction (legacy) ----------
     pnl = t.pnl_z
     bars_norm = t.bars_held / 30.0
     exit_z = t.exit_z if t.exit_z is not None else 0.0
@@ -730,12 +760,24 @@ def trade_to_features(t: "PaperTrade") -> np.ndarray:
         fav,
         best_fav,
         1.0,
+        20.0 / 30.0,
     ], dtype=float)
 
 
-def trade_to_label(t: PaperTrade) -> int:
-    """1 = exit was reasonable (profit or time stop)."""
-    return 1 if t.pnl_z > 0 or t.bars_held > 20 else 0
+def trade_to_label(t: PaperTrade, good_pnl_threshold: float = 0.35) -> int:
+    """
+    Higher-quality binary label for the exit model.
+
+    1 = "good exit" (we should have exited around here)
+    0 = "bad / premature / late exit"
+    """
+    if t.pnl_z >= good_pnl_threshold:
+        return 1
+    if t.pnl_z > 0.05 and 8 <= t.bars_held <= 22:
+        return 1
+    if t.bars_held >= 25 and t.pnl_z > -0.6:
+        return 1
+    return 0
 
 
 def closed_trades_to_frame(
@@ -760,6 +802,9 @@ def closed_trades_to_frame(
             "exit_spread": t.exit_spread,
             "bars_held": t.bars_held,
             "pnl_z": t.pnl_z,
+            "notional": t.notional,
+            "pnl_dollars": t.pnl_dollars,
+            "cost_dollars": t.cost_dollars,
             "ml_proba_at_exit": t.ml_proba_at_exit,
             "label": trade_to_label(t),
             "exit_features_json": (
@@ -859,6 +904,9 @@ def load_training_dataset(
         )
     ds = pd.read_csv(path)
     feat_cols = [f"feat_{n}" for n in FEATURE_NAMES]
+    # Backfill new features (e.g. half_life) for older journals
+    if "feat_half_life" not in ds.columns:
+        ds["feat_half_life"] = 20.0 / 30.0
     missing = [c for c in feat_cols + ["label"] if c not in ds.columns]
     if missing:
         raise ValueError(f"Dataset missing columns: {missing}")
@@ -949,22 +997,41 @@ class PaperTrade:
     exit_spread: float = None
     bars_held: int = 0
     pnl_z: float = 0.0
+    notional: float = 0.0
+    pnl_dollars: float = 0.0
+    cost_dollars: float = 0.0
     status: str = "OPEN"
     ml_proba_at_exit: float = None
     # Exact feature vector at exit time (from extract_exit_features)
     exit_features: Optional[np.ndarray] = None
 
+
 class PaperTrader:
-    def __init__(self, capital=100_000):
+    def __init__(self, capital=100_000, cost_bps: float = 4.0, risk_frac: float = 0.08):
         self.capital = capital
-        self.trades: List[PaperTrade] = []
-        self.current_trade: PaperTrade = None
         self.equity = capital
+        self.cost_bps = cost_bps          # round-trip cost in basis points
+        self.risk_frac = risk_frac
+        self.trades: List[PaperTrade] = []
+        self.current_trade: Optional[PaperTrade] = None
         self.trade_counter = 0
-    
-    def open_trade(self, direction: int, time, z, spread, ticker_a="", ticker_b="", basket=""):
+
+    def open_trade(
+        self,
+        direction: int,
+        time,
+        z,
+        spread,
+        ticker_a="",
+        ticker_b="",
+        basket="",
+        risk_frac: Optional[float] = None,
+    ):
         self.trade_counter += 1
         side = "LONG_SPREAD" if direction == 1 else "SHORT_SPREAD"
+        frac = self.risk_frac if risk_frac is None else float(risk_frac)
+        notional = float(self.equity * frac)
+
         trade = PaperTrade(
             trade_id=self.trade_counter,
             direction=side,
@@ -974,14 +1041,24 @@ class PaperTrader:
             ticker_a=ticker_a,
             ticker_b=ticker_b,
             basket=basket,
+            notional=notional,
         )
         self.current_trade = trade
         self.trades.append(trade)
         pair = f"{ticker_a}/{ticker_b}" if ticker_a and ticker_b else "PAIR"
         print(f"\n🟢 OPENED Trade #{trade.trade_id} | {side} | {pair} [{basket}]")
-        print(f"   Time: {time.date()} | z={z:.2f} | spread={spread:.3f}")
-    
-    def close_trade(self, time, z, spread, ml_proba=None, features: Optional[np.ndarray] = None):
+        print(f"   Time: {time.date()} | z={z:.2f} | spread={spread:.3f} | notional=${notional:,.0f}")
+
+    def close_trade(
+        self,
+        time,
+        z,
+        spread,
+        ml_proba=None,
+        features: Optional[np.ndarray] = None,
+        bars_held: Optional[int] = None,
+        z_to_pct: float = 0.01,
+    ):
         if self.current_trade is None:
             return
 
@@ -989,7 +1066,10 @@ class PaperTrader:
         t.exit_time = time
         t.exit_z = z
         t.exit_spread = spread
-        t.bars_held = (time - t.entry_time).days
+        if bars_held is not None:
+            t.bars_held = max(1, int(bars_held))
+        else:
+            t.bars_held = max(1, int((time - t.entry_time).days))
         t.ml_proba_at_exit = ml_proba
         t.status = "CLOSED"
         t.exit_features = features.copy() if features is not None else None
@@ -999,37 +1079,58 @@ class PaperTrader:
         else:
             t.pnl_z = t.entry_z - z
 
+        # Dollar PnL: 1 z ≈ z_to_pct of notional, minus round-trip costs
+        gross = t.pnl_z * z_to_pct * t.notional
+        cost = t.notional * (self.cost_bps / 10_000.0)
+        t.cost_dollars = float(cost)
+        t.pnl_dollars = float(gross - cost)
+        self.equity += t.pnl_dollars
+
         pair = f"{t.ticker_a}/{t.ticker_b}" if t.ticker_a and t.ticker_b else "PAIR"
         print(f"🔴 CLOSED Trade #{t.trade_id} | {t.direction} | {pair}")
-        print(f"   Time: {time.date()} | z={z:.2f} | PnL(z)={t.pnl_z:+.3f} | Bars={t.bars_held}")
+        print(
+            f"   Time: {time.date()} | z={z:.2f} | PnL(z)={t.pnl_z:+.3f} "
+            f"| PnL($)={t.pnl_dollars:+,.0f} | cost=${cost:,.0f} | Bars={t.bars_held}"
+        )
         if ml_proba is not None:
             print(f"   ML Exit Prob at close: {ml_proba:.2%}")
 
         self.current_trade = None
-    
+
     def summary(self):
         closed = [t for t in self.trades if t.status == "CLOSED"]
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("PAPER TRADING JOURNAL")
-        print("="*60)
+        print("=" * 60)
         for t in closed:
             pair = f"{t.ticker_a}/{t.ticker_b}" if t.ticker_a else "?"
-            print(f"Trade #{t.trade_id:2d} | {pair:13s} | {t.basket:18s} | {t.direction:13s} | "
-                  f"Entry z={t.entry_z:+.2f} → Exit z={t.exit_z:+.2f} | "
-                  f"PnL(z)={t.pnl_z:+.3f} | Held {t.bars_held} bars")
-        
+            print(
+                f"Trade #{t.trade_id:2d} | {pair:13s} | {t.basket:18s} | {t.direction:13s} | "
+                f"Entry z={t.entry_z:+.2f} → Exit z={t.exit_z:+.2f} | "
+                f"PnL(z)={t.pnl_z:+.3f} | PnL($)={t.pnl_dollars:+,.0f} | Held {t.bars_held} bars"
+            )
+
         if closed:
             pnls = [t.pnl_z for t in closed]
+            dollar = [t.pnl_dollars for t in closed]
             print(f"\nTotal closed trades: {len(closed)}")
             print(f"Average PnL (z):     {np.mean(pnls):+.3f}")
+            print(f"Total PnL ($):       {np.sum(dollar):+,.0f}")
+            print(f"Ending equity:       ${self.equity:,.0f}")
             print(f"Win rate:            {np.mean([p > 0 for p in pnls]):.1%}")
             by_basket: Dict[str, List[float]] = {}
+            by_basket_d: Dict[str, List[float]] = {}
             for t in closed:
-                by_basket.setdefault(t.basket or "unknown", []).append(t.pnl_z)
+                key = t.basket or "unknown"
+                by_basket.setdefault(key, []).append(t.pnl_z)
+                by_basket_d.setdefault(key, []).append(t.pnl_dollars)
             print("\nBy basket:")
             for basket, vals in by_basket.items():
-                print(f"  {basket:18s} n={len(vals)}  avg PnL(z)={np.mean(vals):+.3f}")
-        print("="*60)
+                print(
+                    f"  {basket:18s} n={len(vals)}  avg PnL(z)={np.mean(vals):+.3f}  "
+                    f"PnL($)={np.sum(by_basket_d[basket]):+,.0f}"
+                )
+        print("=" * 60)
         return closed
 
 # ============================================================
@@ -1152,7 +1253,11 @@ def _trade_pair_session(
         elif position != 0:
             bars_held = i - entry_idx
             pos_state.bars_held = bars_held
-            features = extract_exit_features(pos_state, row, bars_held, position)
+            # Refresh half-life every bar (cheap AR(1) on recent spread)
+            hl = estimate_half_life(df["spread"].iloc[: i + 1])
+            features = extract_exit_features(
+                pos_state, row, bars_held, position, half_life=hl,
+            )
 
             should_exit, ml_proba = should_exit_with_ml(
                 position=position,
@@ -1168,6 +1273,7 @@ def _trade_pair_session(
                     time, z, row["spread"],
                     ml_proba=ml_proba,
                     features=features,
+                    bars_held=bars_held,
                 )
                 position = 0
                 pos_state = PositionState()
@@ -1222,9 +1328,18 @@ def run_paper_trading_and_train(
     if MODEL_JSON.exists():
         try:
             model = LogisticExitModel.load(MODEL_JSON)
-            print(f"✅ Loaded existing exit model from {MODEL_JSON}")
+            if model.weights is None or len(model.weights) != len(FEATURE_NAMES):
+                print(
+                    f"⚠️ Saved model feature dim mismatch "
+                    f"({None if model.weights is None else len(model.weights)} vs "
+                    f"{len(FEATURE_NAMES)}); running rule-only this session"
+                )
+                model = None
+            else:
+                print(f"✅ Loaded existing exit model from {MODEL_JSON}")
         except Exception as e:
             print(f"⚠️ Could not load model ({e}); running rule-only this session")
+            model = None
     else:
         print("ℹ️  No saved exit model yet — rule-only exits this session")
 

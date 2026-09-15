@@ -89,14 +89,17 @@ class TestExitFeatures(unittest.TestCase):
             "spread_velocity": 0.1,
             "spread_vol": 1.5,
         })
-        feat = m.extract_exit_features(pos, row, bars_held=12, direction=1)
+        feat = m.extract_exit_features(pos, row, bars_held=12, direction=1, half_life=15.0)
         self.assertEqual(feat.shape, (len(m.FEATURE_NAMES),))
         self.assertEqual(feat[0], -2.0)          # entry_z
         self.assertEqual(feat[1], 2.0)           # abs_entry_z
         self.assertAlmostEqual(feat[2], 1.5)     # pnl_proxy = -0.5 - (-2.0)
         self.assertAlmostEqual(feat[3], 12 / 30)
-        self.assertEqual(feat[4], 0.7)
+        # confidence is dynamically scaled by half-life
+        self.assertLess(feat[4], 0.7)
+        self.assertGreater(feat[4], 0.3)
         self.assertEqual(feat[6], -0.5)          # current z
+        self.assertAlmostEqual(feat[10], 15.0 / 30.0)  # half_life
         self.assertGreaterEqual(pos.highest_favorable_z, 1.5)
 
     def test_trade_to_features_matches_feature_names(self):
@@ -135,21 +138,27 @@ class TestExitFeatures(unittest.TestCase):
         np.testing.assert_allclose(feat, live)
 
     def test_close_trade_stores_exit_features_and_frame_json(self):
-        trader = m.PaperTrader()
+        trader = m.PaperTrader(capital=100_000, cost_bps=4.0, risk_frac=0.08)
         trader.open_trade(1, pd.Timestamp("2026-05-01"), -2.0, 1.0, "AAPL", "MSFT", "mag7")
+        self.assertAlmostEqual(trader.trades[0].notional, 8000.0)
         live = np.linspace(0.1, 1.0, len(m.FEATURE_NAMES))
         trader.close_trade(
             pd.Timestamp("2026-05-05"), -0.4, 0.8,
-            ml_proba=0.77, features=live,
+            ml_proba=0.77, features=live, bars_held=4,
         )
         t = trader.trades[0]
         self.assertIsNotNone(t.exit_features)
         np.testing.assert_allclose(t.exit_features, live)
+        self.assertEqual(t.bars_held, 4)
+        self.assertAlmostEqual(t.pnl_z, 1.6)
+        self.assertGreater(t.pnl_dollars, 0.0)
+        self.assertAlmostEqual(t.cost_dollars, 8000.0 * 4.0 / 10000.0)
         frame = m.closed_trades_to_frame([t], run_id="test", data_source="yfinance_live")
         self.assertIn("exit_features_json", frame.columns)
+        self.assertIn("pnl_dollars", frame.columns)
+        self.assertIn("notional", frame.columns)
         parsed = json.loads(frame.loc[0, "exit_features_json"])
         np.testing.assert_allclose(parsed, live)
-        # feat_* columns come from exact vector
         for i, name in enumerate(m.FEATURE_NAMES):
             self.assertAlmostEqual(frame.loc[0, f"feat_{name}"], live[i])
 
@@ -200,6 +209,52 @@ class TestShouldExitWithML(unittest.TestCase):
         )
         self.assertFalse(should)
         self.assertLess(proba, 0.38)
+
+
+
+class TestTradeLabels(unittest.TestCase):
+    def _trade(self, pnl_z, bars_held):
+        return m.PaperTrade(
+            trade_id=1,
+            direction="LONG_SPREAD",
+            entry_time=pd.Timestamp("2026-04-01"),
+            entry_z=-2.0,
+            entry_spread=1.0,
+            exit_time=pd.Timestamp("2026-04-10"),
+            exit_z=-0.5,
+            bars_held=bars_held,
+            pnl_z=pnl_z,
+            status="CLOSED",
+        )
+
+    def test_strong_profit_is_good(self):
+        self.assertEqual(m.trade_to_label(self._trade(0.5, 3)), 1)
+
+    def test_small_profit_reasonable_hold(self):
+        self.assertEqual(m.trade_to_label(self._trade(0.1, 12)), 1)
+
+    def test_defensive_time_stop(self):
+        self.assertEqual(m.trade_to_label(self._trade(-0.4, 26)), 1)
+
+    def test_loss_is_bad(self):
+        self.assertEqual(m.trade_to_label(self._trade(-0.8, 5)), 0)
+
+
+class TestHalfLife(unittest.TestCase):
+    def test_mean_reverting_series_has_finite_half_life(self):
+        rng = np.random.default_rng(0)
+        n = 120
+        x = np.zeros(n)
+        for i in range(1, n):
+            x[i] = 0.7 * x[i - 1] + rng.normal(0, 0.3)
+        hl = m.estimate_half_life(pd.Series(x), lookback=40)
+        self.assertGreaterEqual(hl, 2.0)
+        self.assertLessEqual(hl, 60.0)
+
+    def test_trending_series_returns_long_half_life(self):
+        x = pd.Series(np.linspace(0, 10, 80) + np.random.default_rng(1).normal(0, 0.01, 80))
+        hl = m.estimate_half_life(x, lookback=40)
+        self.assertGreaterEqual(hl, 30.0)
 
 
 class TestOHLCVLoader(unittest.TestCase):
@@ -273,7 +328,15 @@ class TestEndToEndYfinance(unittest.TestCase):
             self.assertIsNotNone(model)
             self.assertIsNotNone(model.weights)
             self.assertEqual(len(model.weights), len(m.FEATURE_NAMES))
+            self.assertIn("half_life", m.FEATURE_NAMES)
             self.assertTrue((tmp_path / "logistic_exit_model.json").exists())
+            for t in closed:
+                self.assertGreater(t.notional, 0.0)
+                self.assertIsNotNone(t.pnl_dollars)
+                self.assertGreaterEqual(t.cost_dollars, 0.0)
+                self.assertEqual(len(t.exit_features), len(m.FEATURE_NAMES))
+            self.assertIn("pnl_dollars", journal.columns)
+            self.assertIn("feat_half_life", pd.read_csv(tmp_path / "exit_training_dataset.csv").columns)
 
 
 if __name__ == "__main__":

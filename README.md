@@ -20,8 +20,8 @@ python paper_trading_ml_exit.py --train-only   # retrain from results/
 - `parkinson` — higher R when the high–low range is wide
 
 Artifacts land in `results/` (gitignored):
-- `paper_trades.csv`
-- `exit_training_dataset.csv`
+- `paper_trades.csv` (includes z-PnL, $-PnL after costs, notional)
+- `exit_training_dataset.csv` (smarter exit labels + `half_life` feature)
 - `logistic_exit_model.json`
 
 ## Scheduler: Cursor Automations (primary)
