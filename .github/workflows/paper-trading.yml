@@ -91,7 +91,8 @@ jobs:
           if-no-files-found: warn
 
       - name: Publish accumulated results to results-data branch
-        if: always()
+        # Avoid push+pull_request double-publish races on the same SHA.
+        if: always() && github.event_name != 'pull_request'
         run: |
           set -e
           git config user.name "github-actions[bot]"
@@ -104,26 +105,29 @@ jobs:
           cp -f results/*.csv results/*.json /tmp/results-out/ 2>/dev/null || true
           rm -rf results
 
-          git fetch --depth=1 origin results-data 2>/dev/null || true
-          if git rev-parse --verify origin/results-data >/dev/null 2>&1; then
-            git checkout -B results-data origin/results-data
-          else
-            git checkout --orphan results-data
-            git rm -rf . >/dev/null 2>&1 || true
-          fi
-
-          mkdir -p results
-          cp -f /tmp/results-out/* results/ 2>/dev/null || true
-
-          git add results
-          if git diff --cached --quiet; then
-            echo "No changes to persist."
-          else
-            git commit -m "Update accumulated paper-trading results"
-            # Concurrent push/PR workflows can race on results-data; retry once.
-            if ! git push origin HEAD:results-data; then
-              git fetch --depth=1 origin results-data
-              git rebase origin/results-data || git rebase --abort
-              git push origin HEAD:results-data
+          for attempt in 1 2 3 4 5; do
+            git fetch --depth=1 origin results-data 2>/dev/null || true
+            if git rev-parse --verify origin/results-data >/dev/null 2>&1; then
+              git checkout -B results-data origin/results-data
+            else
+              git checkout --orphan results-data
+              git rm -rf . >/dev/null 2>&1 || true
             fi
-          fi
+
+            mkdir -p results
+            cp -f /tmp/results-out/* results/ 2>/dev/null || true
+            git add results
+            if git diff --cached --quiet; then
+              echo "No changes to persist."
+              exit 0
+            fi
+            git commit -m "Update accumulated paper-trading results" || true
+            if git push origin HEAD:results-data; then
+              echo "Published results-data (attempt ${attempt})"
+              exit 0
+            fi
+            echo "results-data push race (attempt ${attempt}); retrying..."
+            sleep $((attempt * 2))
+          done
+          echo "Failed to publish results-data after retries"
+          exit 1
