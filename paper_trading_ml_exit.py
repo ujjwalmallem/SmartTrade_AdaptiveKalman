@@ -28,9 +28,8 @@ FEATURE_NAMES = [
 
 # ============================================================
 # PASTE ALL PREVIOUS CLASSES HERE (or keep them in the same file)
-# Required: AdaptiveKalmanPairs, LogisticExitModel, 
-#           PositionState, extract_exit_features, 
-#           generate_training_data, ExitConfig, etc.
+# AdaptiveKalmanPairs + extract_exit_features + LogisticExitModel included below.
+# PositionState, generate_training_data helpers, ExitConfig, etc. can be extended here.
 # ============================================================
 
 # For this standalone version I include minimal working versions
@@ -617,7 +616,7 @@ def closed_trades_to_frame(
 
 def save_paper_results(
     closed_trades: Sequence[PaperTrade],
-    results_dir: Path = RESULTS_DIR,
+    results_dir: Optional[Path] = None,
     run_id: Optional[str] = None,
     data_source: str = "",
 ) -> Tuple[Path, Path]:
@@ -626,7 +625,7 @@ def save_paper_results(
     Prior-year windows (e.g. 2025) are purged so only the latest year remains.
     Returns (trades_csv_path, dataset_csv_path).
     """
-    results_dir = Path(results_dir)
+    results_dir = Path(results_dir) if results_dir is not None else RESULTS_DIR
     results_dir.mkdir(parents=True, exist_ok=True)
     run_id = run_id or pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
     year = _latest_allowed_trade_year()
@@ -687,13 +686,14 @@ def filter_trades_to_latest_year(
 
 
 def load_training_dataset(
-    dataset_path: Path = DATASET_CSV,
+    dataset_path: Optional[Path] = None,
     require_live: bool = True,
     latest_year_only: bool = True,
-    trades_path: Path = TRADES_CSV,
+    trades_path: Optional[Path] = None,
     trade_year: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    path = Path(dataset_path)
+    path = Path(dataset_path) if dataset_path is not None else DATASET_CSV
+    trades_path = Path(trades_path) if trades_path is not None else TRADES_CSV
     if not path.exists():
         raise FileNotFoundError(
             f"No stored dataset at {path}. Run a paper session first to create it."
@@ -748,12 +748,14 @@ def load_training_dataset(
 
 
 def train_from_stored_results(
-    dataset_path: Path = DATASET_CSV,
-    model_path: Path = MODEL_JSON,
+    dataset_path: Optional[Path] = None,
+    model_path: Optional[Path] = None,
     reg: float = 0.3,
     min_samples: int = 2,
 ) -> LogisticExitModel:
     """Fit the exit model on stored yfinance-backed paper trades only."""
+    dataset_path = Path(dataset_path) if dataset_path is not None else DATASET_CSV
+    model_path = Path(model_path) if model_path is not None else MODEL_JSON
     X, y, ds = load_training_dataset(dataset_path, require_live=True)
     if len(y) < min_samples:
         raise ValueError(f"Need at least {min_samples} samples; found {len(y)} in {dataset_path}")
