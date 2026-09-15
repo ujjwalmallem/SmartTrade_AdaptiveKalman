@@ -5,6 +5,7 @@ Ready for Cursor AI
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 from pathlib import Path
@@ -12,6 +13,7 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field, asdict
 from enum import Enum
+from types import SimpleNamespace
 from typing import List, Dict, Iterable, Optional, Sequence, Tuple, Any
 import os
 import warnings
@@ -28,6 +30,7 @@ RESULTS_DIR = Path("results")
 TRADES_CSV = RESULTS_DIR / "paper_trades.csv"
 DATASET_CSV = RESULTS_DIR / "exit_training_dataset.csv"
 MODEL_JSON = RESULTS_DIR / "logistic_exit_model.json"
+SETUPS_GLOB = "setups_*.csv"
 
 FEATURE_NAMES = [
     "entry_z", "abs_entry_z", "pnl_proxy", "bars_held", "confidence",
@@ -837,6 +840,318 @@ def trade_to_label(t: PaperTrade, good_pnl_threshold: float = 0.35) -> int:
     if t.bars_held >= 25 and t.pnl_z > -0.6:
         return 1
     return 0
+
+
+# ============================================================
+# RESEARCH MODE — counterfactual setups (does not touch live journal)
+# ============================================================
+
+@dataclass
+class Setup:
+    """One counterfactual z-crossing simulated to completion (research only)."""
+    setup_id: str
+    run_id: str
+    pair: str
+    basket: str
+    direction: int  # +1 long spread, -1 short
+    entry_time: pd.Timestamp
+    entry_bar: int
+    features: Dict[str, float] = field(default_factory=dict)
+
+    taken: bool = False
+    exit_time: Optional[pd.Timestamp] = None
+    bars_held: Optional[int] = None
+    pnl_z: Optional[float] = None
+    pnl_dollars: Optional[float] = None
+    exit_reason: Optional[str] = None
+
+    label: Optional[int] = None
+    exit_model_version: Optional[str] = None
+    data_window: str = "latest_year"  # or "multi_year"
+
+    def to_row(self) -> dict:
+        row = asdict(self)
+        for k, v in self.features.items():
+            row[f"feat_{k}"] = v
+        del row["features"]
+        for col in ("entry_time", "exit_time"):
+            if row[col] is not None:
+                row[col] = str(row[col])
+        return row
+
+
+def get_exit_model_version(model: Optional["LogisticExitModel"] = None) -> str:
+    """Simple provenance tag for the exit policy used in a research pass."""
+    if model is None or getattr(model, "weights", None) is None:
+        return "rules_only"
+    raw = json.dumps(
+        {
+            "weights": np.asarray(model.weights, dtype=float).tolist(),
+            "bias": float(model.bias) if model.bias is not None else 0.0,
+            "features": list(model.feature_names),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha1(raw.encode()).hexdigest()[:10]
+
+
+def save_setups(
+    setups: List[Setup],
+    results_dir: Path = RESULTS_DIR,
+    run_id: str = "",
+) -> Path:
+    """Write setups_*.csv only — never touches paper_trades / training dataset."""
+    results_dir = Path(results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    run_id = run_id or pd.Timestamp.now("UTC").strftime("%Y%m%dT%H%M%SZ")
+    path = results_dir / f"setups_{run_id}.csv"
+    if not setups:
+        print("No setups to save.")
+        return path
+    df = pd.DataFrame([s.to_row() for s in setups])
+    df.to_csv(path, index=False)
+    print(f"💾 Saved {len(setups)} setups → {path}")
+    return path
+
+
+def _simulate_setups_for_pair(
+    df: pd.DataFrame,
+    pair: PairSpec,
+    model: Optional[LogisticExitModel],
+    run_id: str,
+    data_window: str = "multi_year",
+    ml_threshold: float = 0.62,
+    capital: float = 100_000.0,
+    risk_frac: float = 0.08,
+    cost_bps: float = 4.0,
+    z_to_pct: float = 0.01,
+    trade_year: Optional[int] = None,
+) -> List[Setup]:
+    """
+    Research mode: walk the window and simulate every valid z-crossing to
+    completion. Does not touch PaperTrader / Alpaca / paper_trades.csv.
+
+    Year gate: when data_window == "latest_year", entries outside trade_year
+    are skipped (same idea as live/backtest). multi_year skips that gate.
+    """
+    setups: List[Setup] = []
+    position = 0
+    entry_idx = 0
+    pos_state = PositionState()
+    entry_time = None
+    entry_z = 0.0
+    direction = 0
+    features: Dict[str, float] = {}
+    exit_model_version = get_exit_model_version(model)
+    year = int(trade_year) if trade_year is not None else int(pd.Timestamp(df.index.max()).year)
+    latest_only = (data_window or "latest_year").lower().strip() == "latest_year"
+
+    for i in range(60, len(df)):
+        row = df.iloc[i]
+        z = float(row["zscore"])
+        conf = float(row.get("confidence", 0.5))
+        time = df.index[i]
+
+        # ----- ENTRY -----
+        if position == 0:
+            if latest_only and int(pd.Timestamp(time).year) != year:
+                continue
+            if z < -2.0 and conf > 0.55:
+                direction = 1
+            elif z > 2.0 and conf > 0.55:
+                direction = -1
+            else:
+                continue
+
+            position = direction
+            entry_idx = i
+            entry_time = time
+            entry_z = z
+            pos_state = PositionState(
+                direction=direction,
+                entry_z=z,
+                entry_bar=i,
+                entry_spread=float(row["spread"]),
+                highest_favorable_z=0.0,
+            )
+            half_life = estimate_half_life(df["spread"].iloc[: i + 1], lookback=40)
+            features = {
+                "entry_z": z,
+                "abs_entry_z": abs(z),
+                "confidence": conf,
+                "half_life": float(half_life) / 30.0,
+                "vol": float(row.get("spread_vol", 1.0)),
+                "velocity": float(row.get("spread_velocity", 0.0)),
+            }
+            continue
+
+        # ----- EXIT (exact live helpers) -----
+        bars_held = i - entry_idx
+        pos_state.bars_held = bars_held
+        half_life = estimate_half_life(df["spread"].iloc[: i + 1], lookback=40)
+        feat_vec = extract_exit_features(
+            pos_state, row, bars_held, position, half_life=half_life
+        )
+        should_exit, ml_proba = should_exit_with_ml(
+            position=position,
+            z=z,
+            bars_held=bars_held,
+            features=feat_vec,
+            model=model,
+            ml_threshold=ml_threshold,
+        )
+        if not should_exit:
+            continue
+
+        if direction == 1:
+            pnl_z = z - entry_z
+        else:
+            pnl_z = entry_z - z
+        notional = float(capital) * float(risk_frac)
+        gross = pnl_z * z_to_pct * notional
+        cost = notional * (cost_bps / 10_000.0)
+        pnl_dollars = float(gross - cost)
+        exit_reason = (
+            "ml"
+            if (ml_proba is not None and ml_proba >= ml_threshold)
+            else "rules"
+        )
+        label = trade_to_label(
+            SimpleNamespace(pnl_z=pnl_z, bars_held=bars_held)  # type: ignore[arg-type]
+        )
+        setups.append(
+            Setup(
+                setup_id=f"{run_id}_{pair.label}_{entry_idx}",
+                run_id=run_id,
+                pair=pair.label,
+                basket=pair.basket,
+                direction=direction,
+                entry_time=entry_time,
+                entry_bar=entry_idx,
+                features=dict(features),
+                taken=False,
+                exit_time=time,
+                bars_held=bars_held,
+                pnl_z=float(pnl_z),
+                pnl_dollars=pnl_dollars,
+                exit_reason=exit_reason,
+                label=int(label),
+                exit_model_version=exit_model_version,
+                data_window=data_window,
+            )
+        )
+        position = 0
+
+    return setups
+
+
+def run_research_setups(
+    n_bars: int = 700,
+    baskets: Optional[Sequence[str]] = None,
+    include_cross: bool = True,
+    max_pairs_per_basket: int = 6,
+    ml_threshold: float = 0.62,
+    noise_model: KalmanNoiseModel | str = KalmanNoiseModel.STANDARD,
+    data_source: str = "auto",
+    data_window: str = "multi_year",
+) -> Tuple[List[Setup], Path]:
+    """
+    Counterfactual research pass over the pair universe.
+    Writes results/setups_<run_id>.csv only (no broker, no paper journal).
+    """
+    data_window = (data_window or "multi_year").lower().strip()
+    if data_window not in ("multi_year", "latest_year"):
+        raise ValueError("data_window must be 'multi_year' or 'latest_year'")
+
+    print("Starting Research Setup Pass...")
+    print(f"Mode: research (data_window={data_window})")
+    print("Simulates every valid z-crossing to completion — no Alpaca / no paper journal\n")
+
+    baskets = list(baskets) if baskets is not None else list(TICKER_UNIVERSES.keys())
+    pairs = build_pair_universe(
+        baskets=baskets,
+        include_cross=include_cross,
+        max_pairs_per_basket=max_pairs_per_basket,
+    )
+    summarize_universes(pairs)
+
+    tickers = all_universe_tickers(baskets)
+    panels, source = _load_prices_for_universe(tickers, n_bars, data_source=data_source)
+    trade_year = int(
+        next(iter(panels.values())).attrs.get(
+            "trade_year", pd.Timestamp(next(iter(panels.values())).index.max()).year
+        )
+    )
+    fields = ohlcv_field_panels(panels)
+    prices = fields["close"]
+    highs = fields["high"]
+    lows = fields["low"]
+    volumes = fields["volume"]
+    if isinstance(noise_model, str):
+        noise_model = KalmanNoiseModel(noise_model)
+
+    print(f"\nPrice panel: {prices.shape[1]} tickers × {prices.shape[0]} bars  [source: {source}]")
+    print(f"Kalman R mode: {noise_model.value}")
+    if data_window == "latest_year":
+        print(f"Research entries: {trade_year} only\n")
+    else:
+        print("Research entries: all bars in loaded panel (no year gate)\n")
+
+    model = None
+    if MODEL_JSON.exists():
+        try:
+            model = LogisticExitModel.load(MODEL_JSON)
+            if model.weights is None or len(model.weights) != len(FEATURE_NAMES):
+                model = None
+            else:
+                print(f"✅ Loaded exit model from {MODEL_JSON}")
+        except Exception as exc:
+            print(f"⚠️ Could not load model ({exc}); rules-only research")
+            model = None
+    else:
+        print("ℹ️  No saved exit model — rules-only research exits")
+
+    run_id = pd.Timestamp.now("UTC").strftime("%Y%m%dT%H%M%SZ")
+    kf = AdaptiveKalmanPairs(delta=1e-4, R_base=1e-2, noise_model=noise_model)
+    all_setups: List[Setup] = []
+
+    for pair in pairs:
+        if pair.ticker_a not in prices.columns or pair.ticker_b not in prices.columns:
+            continue
+        vol_a = volumes[pair.ticker_a] if pair.ticker_a in volumes.columns else None
+        hi_a = highs[pair.ticker_a] if pair.ticker_a in highs.columns else None
+        lo_a = lows[pair.ticker_a] if pair.ticker_a in lows.columns else None
+        df = kf.filter_pair(
+            prices[pair.ticker_a],
+            prices[pair.ticker_b],
+            volume=vol_a,
+            high=hi_a,
+            low=lo_a,
+        )
+        print(f"\n--- Research {pair.label} [{pair.basket}] ---")
+        pair_setups = _simulate_setups_for_pair(
+            df=df,
+            pair=pair,
+            model=model,
+            run_id=run_id,
+            data_window=data_window,
+            ml_threshold=ml_threshold,
+            trade_year=trade_year,
+        )
+        print(f"   setups: {len(pair_setups)}")
+        all_setups.extend(pair_setups)
+
+    path = save_setups(all_setups, run_id=run_id)
+    if all_setups:
+        labels = [s.label for s in all_setups if s.label is not None]
+        pnls = [s.pnl_z for s in all_setups if s.pnl_z is not None]
+        print(f"\nResearch summary: {len(all_setups)} setups")
+        if labels:
+            print(f"  label=1 rate: {np.mean(labels):.1%}")
+        if pnls:
+            print(f"  mean pnl_z:   {np.mean(pnls):+.3f}")
+        print(f"  model tag:    {get_exit_model_version(model)}")
+    return all_setups, path
 
 
 def closed_trades_to_frame(
@@ -1654,10 +1969,24 @@ def run_paper_trading_and_train(
     alpaca_dry_run: bool = False,
     data_source: str = "auto",
     mode: str = "backtest",
+    data_window: str = "multi_year",
 ):
     mode = (mode or "backtest").lower().strip()
-    if mode not in ("backtest", "live"):
-        raise ValueError("mode must be 'backtest' or 'live'")
+    if mode not in ("backtest", "live", "research"):
+        raise ValueError("mode must be 'backtest', 'live', or 'research'")
+
+    if mode == "research":
+        setups, path = run_research_setups(
+            n_bars=n_bars,
+            baskets=baskets,
+            include_cross=include_cross,
+            max_pairs_per_basket=max_pairs_per_basket,
+            ml_threshold=ml_threshold,
+            noise_model=noise_model,
+            data_source=data_source,
+            data_window=data_window,
+        )
+        return setups, None, path
 
     print("Starting Paper Trading Session...")
     print(f"Mode: {mode}")
@@ -1841,9 +2170,19 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mode",
-        choices=["backtest", "live"],
+        choices=["backtest", "live", "research"],
         default="backtest",
-        help="backtest=replay history for ML journal; live=act only on latest bar (Alpaca paper)",
+        help=(
+            "backtest=replay history for ML journal; "
+            "live=act only on latest bar (Alpaca paper); "
+            "research=counterfactual setups → results/setups_*.csv (no broker)"
+        ),
+    )
+    parser.add_argument(
+        "--data-window",
+        choices=["multi_year", "latest_year"],
+        default="multi_year",
+        help="Research mode only: whether to year-gate entry signals",
     )
     parser.add_argument(
         "--data-source",
@@ -1888,9 +2227,14 @@ if __name__ == "__main__":
             alpaca_dry_run=args.alpaca_dry_run,
             data_source=args.data_source,
             mode=args.mode,
+            data_window=args.data_window,
         )
 
-        if model is None:
+        if args.mode == "research":
+            print("\n🎯 Research setup pass complete.")
+            print(f"   Setups: {data}")
+            print("Live/backtest journal untouched.")
+        elif model is None:
             print("\n⚠️ Paper trading finished without enough trades to train.")
         else:
             print("\n🎯 Paper trading session complete.")
