@@ -257,7 +257,10 @@ class TestHalfLife(unittest.TestCase):
 
 class TestOHLCVLoader(unittest.TestCase):
     def test_fetch_returns_per_ticker_ohlcv(self):
-        panels = m.fetch_real_prices_for_universe(["AAPL", "MSFT", "NVDA"], n_bars=400)
+        panels, source = m.fetch_real_prices_for_universe(
+            ["AAPL", "MSFT", "NVDA"], n_bars=400, data_source="yfinance"
+        )
+        self.assertIn(source, {"yfinance_live", "alpaca_live"})
         self.assertGreaterEqual(len(panels), 2)
         for ticker, df in panels.items():
             self.assertIn("Close", df.columns)
@@ -270,18 +273,33 @@ class TestOHLCVLoader(unittest.TestCase):
         self.assertTrue(all(ix == idxs[0] for ix in idxs))
 
     def test_field_panels_helper(self):
-        panels = m.fetch_real_prices_for_universe(["AAPL", "MSFT"], n_bars=400)
+        panels, _ = m.fetch_real_prices_for_universe(
+            ["AAPL", "MSFT"], n_bars=400, data_source="yfinance"
+        )
         fields = m.ohlcv_field_panels(panels)
         self.assertEqual(set(fields), {"close", "high", "low", "volume"})
         self.assertTrue(fields["close"].columns.equals(pd.Index(list(panels.keys()))))
         self.assertEqual(fields["close"].attrs.get("trade_year"), 2026)
 
     def test_load_prices_returns_ticker_panels(self):
-        panels, source = m._load_prices_for_universe(["AAPL", "MSFT", "GOOGL"], n_bars=400)
+        panels, source = m._load_prices_for_universe(
+            ["AAPL", "MSFT", "GOOGL"], n_bars=400, data_source="yfinance"
+        )
         self.assertEqual(source, "yfinance_live")
         self.assertNotIn("close", panels)  # ticker-keyed, not field-keyed
         self.assertIn("AAPL", panels)
         self.assertIn("Close", panels["AAPL"].columns)
+
+
+    def test_auto_falls_back_to_yfinance_without_alpaca_creds(self):
+        import os
+        for k in ("ALPACA_API_KEY", "ALPACA_API_SECRET_KEY", "APCA_API_KEY_ID", "APCA_API_SECRET_KEY"):
+            os.environ.pop(k, None)
+        panels, source = m.fetch_real_prices_for_universe(
+            ["AAPL", "MSFT"], n_bars=400, data_source="auto"
+        )
+        self.assertEqual(source, "yfinance_live")
+        self.assertGreaterEqual(len(panels), 2)
 
 
 class TestLatestYearFilter(unittest.TestCase):
@@ -338,7 +356,38 @@ class TestEndToEndYfinance(unittest.TestCase):
 
 
 
+class TestAlpacaDataPrimary(unittest.TestCase):
+    def test_alpaca_primary_path_with_mock(self):
+        import types
+        idx = pd.date_range("2025-10-01", periods=200, freq="B")
+        def fake_fetch(tickers, period="2y", min_bars=80):
+            out = {}
+            for i, tkr in enumerate(tickers):
+                px = 100 + i * 10 + np.cumsum(np.random.default_rng(0).normal(0, 0.5, len(idx)))
+                out[tkr] = pd.DataFrame({
+                    "Open": px, "High": px + 1, "Low": px - 1, "Close": px,
+                    "Volume": np.full(len(idx), 1e6),
+                }, index=idx)
+            return out
+        # Patch credentials + fetch
+        real_present = m.alpaca_credentials_present
+        real_fetch = m.fetch_alpaca_daily_ohlcv
+        m.alpaca_credentials_present = lambda: True
+        m.fetch_alpaca_daily_ohlcv = fake_fetch
+        try:
+            panels, source = m.fetch_real_prices_for_universe(
+                ["AAPL", "MSFT", "NVDA"], n_bars=400, data_source="auto"
+            )
+            self.assertEqual(source, "alpaca_live")
+            self.assertEqual(len(panels), 3)
+            self.assertIn("Close", panels["AAPL"].columns)
+        finally:
+            m.alpaca_credentials_present = real_present
+            m.fetch_alpaca_daily_ohlcv = real_fetch
+
+
 class TestAlpacaBroker(unittest.TestCase):
+
     def test_dry_run_pair_round_trip(self):
         from alpaca_paper_broker import AlpacaPaperBroker
         br = AlpacaPaperBroker(paper=True, dry_run=True)

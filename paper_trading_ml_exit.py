@@ -17,7 +17,11 @@ import os
 import warnings
 warnings.filterwarnings("ignore")
 
-from alpaca_paper_broker import AlpacaPaperBroker, alpaca_credentials_present
+from alpaca_paper_broker import (
+    AlpacaPaperBroker,
+    alpaca_credentials_present,
+    fetch_daily_ohlcv as fetch_alpaca_daily_ohlcv,
+)
 
 # Default artifact locations (gitignored locally; CI uploads as artifacts)
 RESULTS_DIR = Path("results")
@@ -201,77 +205,17 @@ class PositionState:
     current_size: float = 0.0
     bars_held: int = 0
 
-def fetch_real_prices_for_universe(
-    tickers: Sequence[str],
-    n_bars: int = 700,
-    period: str = "2y",
-    min_bars: int = 80,
-    trade_year: Optional[int] = None,
+def _align_ohlcv_panels(
+    panels: Dict[str, pd.DataFrame],
+    n_bars: int,
+    min_bars: int,
+    trade_year: Optional[int],
+    source_label: str,
 ) -> Dict[str, pd.DataFrame]:
-    """
-    Real daily OHLCV via yfinance only (no synthetic data).
-
-    Returns a dict of DataFrames, one per ticker, each containing:
-        Open, High, Low, Close, Volume
-    (Open is included for completeness; we mainly use H/L/C/V).
-
-    Aligns tickers on shared trading days. Keeps enough history for
-    indicator warm-up, but trade windows are restricted to `trade_year`
-    (default: the calendar year of the latest bar).
-    """
-    import yfinance as yf
-
-    tickers = list(dict.fromkeys(tickers))  # de-dup, preserve order
-    print(f"Fetching yfinance OHLCV for {len(tickers)} tickers (period={period})...")
-
-    raw = yf.download(
-        tickers=tickers,
-        period=period,
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
-
-    if raw is None or raw.empty:
-        raise RuntimeError("yfinance returned no data")
-
-    panels: Dict[str, pd.DataFrame] = {}
-
-    for t in tickers:
-        try:
-            if isinstance(raw.columns, pd.MultiIndex):
-                df = raw[t].copy()
-            else:
-                # single-ticker case
-                df = raw.copy()
-
-            cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-            if "Close" not in cols:
-                continue
-            df = df[cols].copy()
-            df = df.apply(pd.to_numeric, errors="coerce").dropna(how="all")
-
-            if df["Close"].dropna().shape[0] >= min_bars:
-                panels[t] = df
-        except Exception:
-            continue
-
-    missing = [t for t in tickers if t not in panels]
-    if missing:
-        print(f"⚠️  Dropping tickers with no usable yfinance history: {', '.join(missing)}")
-
-    if len(panels) < 2:
-        raise RuntimeError(
-            "yfinance returned usable OHLCV for fewer than 2 tickers; "
-            "cannot build pairs for training"
-        )
-
-    # Align all tickers on the intersection of trading days (Close as reference)
+    """Align ticker OHLCV on shared days and restrict to latest trade year + warm-up."""
     closes = pd.DataFrame({t: panels[t]["Close"] for t in panels}).dropna(how="any")
     if closes.empty:
-        raise RuntimeError("No overlapping trading days across fetched tickers")
+        raise RuntimeError(f"No overlapping trading days across {source_label} tickers")
 
     closes = closes.tail(max(n_bars, min_bars + 60))
     common_index = closes.index
@@ -284,13 +228,13 @@ def fetch_real_prices_for_universe(
 
     in_year = common_index.year == year
     if not in_year.any():
-        raise RuntimeError(f"No yfinance bars in latest year {year}")
+        raise RuntimeError(f"No {source_label} bars in latest year {year}")
 
     first_trade_i = int(in_year.argmax())
     warm_start = max(0, first_trade_i - 60)
     final_index = common_index[warm_start:]
 
-    # Keep every ticker on the exact same calendar so pair scans stay aligned
+    aligned: Dict[str, pd.DataFrame] = {}
     for t in list(panels.keys()):
         frame = panels[t].reindex(final_index)
         if "Volume" in frame.columns:
@@ -298,8 +242,8 @@ def fetch_real_prices_for_universe(
         for col in ("Open", "High", "Low", "Close"):
             if col in frame.columns:
                 frame[col] = frame[col].ffill()
-        panels[t] = frame
-        panels[t].attrs["trade_year"] = year
+        frame.attrs["trade_year"] = year
+        aligned[t] = frame
 
     trade_bars = int((final_index.year == year).sum())
     if trade_bars < 40:
@@ -308,11 +252,127 @@ def fetch_real_prices_for_universe(
         )
 
     print(
-        f"yfinance OHLCV ready: {len(panels)} tickers × {len(final_index)} bars "
+        f"{source_label} OHLCV ready: {len(aligned)} tickers × {len(final_index)} bars "
         f"[{final_index.min().date()} → {final_index.max().date()}] "
         f"(trades restricted to {year}: {trade_bars} bars)"
     )
-    return panels
+    return aligned
+
+
+def fetch_ohlcv_from_yfinance(
+    tickers: Sequence[str],
+    n_bars: int = 700,
+    period: str = "2y",
+    min_bars: int = 80,
+    trade_year: Optional[int] = None,
+) -> Dict[str, pd.DataFrame]:
+    """Daily OHLCV via yfinance (backup source)."""
+    import yfinance as yf
+
+    tickers = list(dict.fromkeys(tickers))
+    print(f"Fetching yfinance OHLCV for {len(tickers)} tickers (period={period})...")
+
+    raw = yf.download(
+        tickers=tickers,
+        period=period,
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=True,
+        progress=False,
+        threads=True,
+    )
+    if raw is None or raw.empty:
+        raise RuntimeError("yfinance returned no data")
+
+    panels: Dict[str, pd.DataFrame] = {}
+    for t in tickers:
+        try:
+            df = raw[t].copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
+            cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            if "Close" not in cols:
+                continue
+            df = df[cols].apply(pd.to_numeric, errors="coerce").dropna(how="all")
+            if df["Close"].dropna().shape[0] >= min_bars:
+                panels[t] = df
+        except Exception:
+            continue
+
+    missing = [t for t in tickers if t not in panels]
+    if missing:
+        print(f"⚠️  Dropping tickers with no usable yfinance history: {', '.join(missing)}")
+    if len(panels) < 2:
+        raise RuntimeError(
+            "yfinance returned usable OHLCV for fewer than 2 tickers; "
+            "cannot build pairs for training"
+        )
+    return _align_ohlcv_panels(panels, n_bars, min_bars, trade_year, "yfinance")
+
+
+def fetch_ohlcv_from_alpaca(
+    tickers: Sequence[str],
+    n_bars: int = 700,
+    period: str = "2y",
+    min_bars: int = 80,
+    trade_year: Optional[int] = None,
+) -> Dict[str, pd.DataFrame]:
+    """Daily OHLCV via Alpaca market data (primary source)."""
+    if not alpaca_credentials_present():
+        raise RuntimeError("Alpaca credentials missing")
+    panels = fetch_alpaca_daily_ohlcv(tickers, period=period, min_bars=min_bars)
+    return _align_ohlcv_panels(panels, n_bars, min_bars, trade_year, "alpaca")
+
+
+def fetch_real_prices_for_universe(
+    tickers: Sequence[str],
+    n_bars: int = 700,
+    period: str = "2y",
+    min_bars: int = 80,
+    trade_year: Optional[int] = None,
+    data_source: str = "auto",
+) -> Tuple[Dict[str, pd.DataFrame], str]:
+    """
+    Real daily OHLCV — Alpaca primary, yfinance backup (never synthetic).
+
+    data_source:
+      - auto     : try Alpaca, fall back to yfinance
+      - alpaca   : Alpaca only
+      - yfinance : yfinance only
+
+    Returns (panels_dict, source_label) where panels are keyed by ticker with
+    Open/High/Low/Close/Volume columns.
+    """
+    mode = (data_source or "auto").lower().strip()
+    errors: List[str] = []
+
+    if mode in ("auto", "alpaca"):
+        try:
+            panels = fetch_ohlcv_from_alpaca(
+                tickers, n_bars=n_bars, period=period, min_bars=min_bars, trade_year=trade_year
+            )
+            return panels, "alpaca_live"
+        except Exception as exc:
+            msg = f"Alpaca OHLCV failed: {exc}"
+            errors.append(msg)
+            print(f"⚠️  {msg}")
+            if mode == "alpaca":
+                raise
+
+    if mode in ("auto", "yfinance"):
+        try:
+            panels = fetch_ohlcv_from_yfinance(
+                tickers, n_bars=n_bars, period=period, min_bars=min_bars, trade_year=trade_year
+            )
+            if errors:
+                print("ℹ️  Using yfinance backup after Alpaca failure")
+            return panels, "yfinance_live"
+        except Exception as exc:
+            errors.append(f"yfinance OHLCV failed: {exc}")
+            if mode == "yfinance":
+                raise
+
+    raise RuntimeError(
+        "Unable to load OHLCV from Alpaca or yfinance. " + " | ".join(errors)
+    )
 
 
 def ohlcv_field_panels(ticker_panels: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -342,31 +402,37 @@ def fetch_market_panels_for_universe(
     period: str = "2y",
     min_bars: int = 80,
     trade_year: Optional[int] = None,
+    data_source: str = "auto",
 ) -> Dict[str, pd.DataFrame]:
     """
     Field-oriented OHLCV panels (close/high/low/volume).
     Thin wrapper over per-ticker fetch_real_prices_for_universe.
     """
-    return ohlcv_field_panels(
-        fetch_real_prices_for_universe(
-            tickers, n_bars=n_bars, period=period, min_bars=min_bars, trade_year=trade_year
-        )
+    panels, _src = fetch_real_prices_for_universe(
+        tickers,
+        n_bars=n_bars,
+        period=period,
+        min_bars=min_bars,
+        trade_year=trade_year,
+        data_source=data_source,
     )
+    return ohlcv_field_panels(panels)
 
 
 def _load_prices_for_universe(
     tickers: Sequence[str],
     n_bars: int,
     trade_year: Optional[int] = None,
+    data_source: str = "auto",
 ) -> Tuple[Dict[str, pd.DataFrame], str]:
     """
-    Load full OHLCV panels (keyed by ticker). yfinance only — never synthesizes data.
+    Load full OHLCV panels (keyed by ticker).
+    Alpaca primary, yfinance backup — never synthesizes data.
     Returns (panels_dict, source_label).
     """
-    panels = fetch_real_prices_for_universe(
-        tickers, n_bars=n_bars, trade_year=trade_year
+    return fetch_real_prices_for_universe(
+        tickers, n_bars=n_bars, trade_year=trade_year, data_source=data_source
     )
-    return panels, "yfinance_live"
 
 
 # ============================================================
@@ -911,13 +977,15 @@ def load_training_dataset(
     # Training must use real prices only — drop any legacy synthetic rows.
     if require_live and "data_source" in ds.columns:
         before = len(ds)
-        ds = ds[ds["data_source"].astype(str).str.startswith("yfinance")].copy()
+        src = ds["data_source"].astype(str)
+        keep = src.str.startswith("yfinance") | src.str.startswith("alpaca")
+        ds = ds[keep].copy()
         dropped = before - len(ds)
         if dropped:
-            print(f"⚠️  Dropped {dropped} non-yfinance rows from training dataset")
+            print(f"⚠️  Dropped {dropped} non-live rows from training dataset")
         if ds.empty:
             raise ValueError(
-                "No yfinance rows left in the training dataset. "
+                "No live (alpaca/yfinance) rows left in the training dataset. "
                 "Re-run paper trading to collect real-price samples."
             )
 
@@ -957,14 +1025,14 @@ def train_from_stored_results(
     reg: float = 0.3,
     min_samples: int = 2,
 ) -> LogisticExitModel:
-    """Fit the exit model on stored yfinance-backed paper trades only."""
+    """Fit the exit model on stored live (Alpaca/yfinance) paper trades only."""
     dataset_path = Path(dataset_path) if dataset_path is not None else DATASET_CSV
     model_path = Path(model_path) if model_path is not None else MODEL_JSON
     X, y, ds = load_training_dataset(dataset_path, require_live=True)
     if len(y) < min_samples:
         raise ValueError(f"Need at least {min_samples} samples; found {len(y)} in {dataset_path}")
 
-    print(f"\nTraining from stored results: {len(y)} yfinance samples ({dataset_path})")
+    print(f"\nTraining from stored results: {len(y)} live samples ({dataset_path})")
     if "data_source" in ds.columns:
         print(f"  Sources: {sorted(ds['data_source'].dropna().astype(str).unique().tolist())}")
     print(f"  Baskets: {sorted(ds['basket'].dropna().unique().tolist()) if 'basket' in ds else 'n/a'}")
@@ -1425,6 +1493,7 @@ def run_paper_trading_and_train(
     broker: str = "sim",
     alpaca_latest_only: bool = True,
     alpaca_dry_run: bool = False,
+    data_source: str = "auto",
 ):
     print("Starting Paper Trading Session...")
     print("Goal: Complete at least", min_trades, "round-trip trades\n")
@@ -1438,9 +1507,11 @@ def run_paper_trading_and_train(
     )
     summarize_universes(pairs)
 
-    # 1. Full OHLCV: yfinance only; trades restricted to latest calendar year
+    # 1. Full OHLCV: Alpaca primary / yfinance backup; latest calendar year trades
     tickers = all_universe_tickers(baskets)
-    panels, data_source = _load_prices_for_universe(tickers, n_bars)
+    panels, data_source = _load_prices_for_universe(
+        tickers, n_bars, data_source=data_source
+    )
     trade_year = int(next(iter(panels.values())).attrs.get(
         "trade_year", pd.Timestamp(next(iter(panels.values())).index.max()).year
     ))
@@ -1576,6 +1647,12 @@ if __name__ == "__main__":
         help="Kalman measurement-noise mode: standard | volume | parkinson",
     )
     parser.add_argument(
+        "--data-source",
+        choices=["auto", "alpaca", "yfinance"],
+        default="auto",
+        help="OHLCV source: auto (Alpaca then yfinance), alpaca, or yfinance",
+    )
+    parser.add_argument(
         "--broker",
         choices=["sim", "alpaca"],
         default="sim",
@@ -1607,6 +1684,7 @@ if __name__ == "__main__":
             broker=args.broker,
             alpaca_latest_only=not args.alpaca_all_bars,
             alpaca_dry_run=args.alpaca_dry_run,
+            data_source=args.data_source,
         )
 
         if model is None:

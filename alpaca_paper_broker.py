@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import pandas as pd
 
 
 def _env_first(*names: str) -> Optional[str]:
@@ -230,3 +233,119 @@ class AlpacaPaperBroker:
         if self.dry_run:
             return []
         return list(self._client.get_all_positions())
+
+
+def _period_to_start(period: str) -> datetime:
+    """Map yfinance-style period strings to a UTC start timestamp."""
+    now = datetime.now(timezone.utc)
+    mapping = {
+        "1y": 365,
+        "2y": 730,
+        "5y": 365 * 5,
+        "6mo": 182,
+        "3mo": 90,
+        "1mo": 31,
+    }
+    days = mapping.get(str(period).lower(), 730)
+    return now - timedelta(days=days)
+
+
+def fetch_daily_ohlcv(
+    tickers: Sequence[str],
+    period: str = "2y",
+    min_bars: int = 80,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Batch-fetch daily OHLCV from Alpaca market data.
+
+    Returns {ticker: DataFrame[Open, High, Low, Close, Volume]} (tz-naive index).
+    Uses IEX feed (free / paper-friendly). Raises on hard failures.
+    """
+    from alpaca.data.enums import Adjustment, DataFeed
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+
+    tickers = list(dict.fromkeys(tickers))
+    if not tickers:
+        raise RuntimeError("No tickers requested for Alpaca OHLCV")
+
+    key = api_key or _env_first("ALPACA_API_KEY", "APCA_API_KEY_ID")
+    secret = secret_key or _env_first("ALPACA_API_SECRET_KEY", "APCA_API_SECRET_KEY")
+    if not key or not secret:
+        raise RuntimeError("Alpaca credentials missing for market data")
+
+    client = StockHistoricalDataClient(key, secret)
+    start = _period_to_start(period)
+    end = datetime.now(timezone.utc)
+
+    print(
+        f"Fetching Alpaca OHLCV for {len(tickers)} tickers "
+        f"(feed=IEX, timeframe=1Day, period={period})..."
+    )
+    req = StockBarsRequest(
+        symbol_or_symbols=tickers,
+        timeframe=TimeFrame.Day,
+        start=start,
+        end=end,
+        adjustment=Adjustment.ALL,
+        feed=DataFeed.IEX,
+    )
+    bars = client.get_stock_bars(req)
+    raw = bars.df
+    if raw is None or raw.empty:
+        raise RuntimeError("Alpaca returned no bar data")
+
+    panels: Dict[str, pd.DataFrame] = {}
+
+    # alpaca-py returns MultiIndex (symbol, timestamp) or single-symbol flat index
+    if isinstance(raw.index, pd.MultiIndex):
+        symbols = raw.index.get_level_values(0).unique().tolist()
+        for sym in symbols:
+            try:
+                frame = raw.xs(sym, level=0).copy()
+            except Exception:
+                continue
+            panels[sym] = _normalize_alpaca_frame(frame, min_bars=min_bars)
+    else:
+        # Single symbol response
+        sym = tickers[0]
+        panels[sym] = _normalize_alpaca_frame(raw.copy(), min_bars=min_bars)
+
+    panels = {k: v for k, v in panels.items() if v is not None and not v.empty}
+    missing = [t for t in tickers if t not in panels]
+    if missing:
+        print(f"⚠️  Dropping tickers with no usable Alpaca history: {', '.join(missing)}")
+    if len(panels) < 2:
+        raise RuntimeError(
+            "Alpaca returned usable OHLCV for fewer than 2 tickers; "
+            "cannot build pairs for training"
+        )
+    return panels
+
+
+def _normalize_alpaca_frame(frame: pd.DataFrame, min_bars: int = 80) -> Optional[pd.DataFrame]:
+    rename = {
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "volume": "Volume",
+    }
+    cols = {c: rename[c] for c in frame.columns if c in rename}
+    if "Close" not in cols.values() and "close" not in frame.columns:
+        return None
+    out = frame.rename(columns=cols)
+    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in out.columns]
+    out = out[keep].apply(pd.to_numeric, errors="coerce").dropna(how="all")
+    # tz-naive dates for alignment with the rest of the pipeline
+    idx = pd.to_datetime(out.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    out.index = idx
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    if "Close" not in out.columns or out["Close"].dropna().shape[0] < min_bars:
+        return None
+    return out

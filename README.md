@@ -6,7 +6,9 @@ Paper trading + ML exit trainer for **Mag7 / semis / memory / hyperscaler** pair
 
 ```bash
 pip install -r requirements.txt
-python paper_trading_ml_exit.py                          # local sim journal
+python paper_trading_ml_exit.py                          # Alpaca data (auto) + local sim journal
+python paper_trading_ml_exit.py --data-source auto       # Alpaca primary, yfinance backup
+python paper_trading_ml_exit.py --data-source yfinance   # force Yahoo backup
 python paper_trading_ml_exit.py --broker alpaca          # Alpaca *paper* for latest-bar fills
 python paper_trading_ml_exit.py --noise-model volume
 python paper_trading_ml_exit.py --train-only
@@ -36,7 +38,7 @@ python paper_trading_ml_exit.py --broker alpaca
 
 Historical bars still drive Kalman / ML training in-process; only the most recent signal date is routed to Alpaca so replay does not spam orders.
 
-**Data:** per-ticker OHLCV from **yfinance only** (no synthetic). Each ticker panel includes Open/High/Low/Close/Volume; High/Low/Volume feed adaptive Kalman R modes. Trade windows and training samples are restricted to the **latest calendar year** (e.g. 2026) — prior years like 2025 are excluded.
+**Data:** per-ticker OHLCV from **Alpaca first** (IEX daily bars), with **yfinance as backup** if Alpaca credentials/data fail. Never synthetic. Each ticker panel includes Open/High/Low/Close/Volume; High/Low/Volume feed adaptive Kalman R modes. Trade windows and training samples are restricted to the **latest calendar year** (e.g. 2026) — prior years like 2025 are excluded.
 
 **Kalman R modes** (`--noise-model`):
 - `standard` — fixed (price-scale calibrated) measurement noise
