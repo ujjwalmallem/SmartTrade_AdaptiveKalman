@@ -31,7 +31,7 @@ python paper_trading_ml_exit.py --train-only
    - `ALPACA_API_SECRET_KEY`
 3. Live mode is **idempotent**: if QCOM/AVGO (or any pair) is already open on Alpaca, the next run adopts it for exit management and will **not** stack duplicate entries.
 4. Fresh live entries **hold overnight** (no same-bar exit) so Alpaca is not asked to reverse a just-submitted pair (wash-trade). Failed exits leave the journal **OPEN**.
-5. The CSV journal dedupes repeated `broker=sim` backtest replays; look for `broker=alpaca_paper` rows for real paper fills.
+5. The CSV journal drops wash CLOSED rows (`entry==exit`, `pnl_z≈0`) and dedupes repeated sim **and** alpaca OPEN adopts for the same pair/entry (keeps one live OPEN, or a real CLOSED when present). Year filter for training keeps `entry` in the latest year without requiring `exit` in-year.
 
 CI (with GitHub Secrets) runs two steps when Alpaca keys exist:
    1. `--mode backtest --broker sim` → builds the ML journal from history
