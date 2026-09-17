@@ -359,6 +359,7 @@ class TestEndToEndYfinance(unittest.TestCase):
                 min_trades=2,
                 baskets=["mag7", "semis", "memory", "hyperscaler"],
                 include_cross=True,
+                journal_scope="all",  # this test exercises sim fills; production default is alpaca
             )
             self.assertIsNotNone(trader)
             closed = [t for t in trader.trades if t.status == "CLOSED"]
@@ -581,13 +582,86 @@ class TestLiveMode(unittest.TestCase):
                 qty_b=11.0,
                 status="OPEN",
             )
-            path, ds_path = m.save_paper_results([trade], results_dir=tmp_path, data_source="alpaca_live")
+            path, ds_path = m.save_paper_results(
+                [trade],
+                results_dir=tmp_path,
+                data_source="alpaca_live",
+                journal_scope="alpaca",
+            )
             journal = pd.read_csv(path)
             self.assertEqual(len(journal), 1)
             self.assertEqual(journal.iloc[0]["status"], "OPEN")
             self.assertEqual(journal.iloc[0]["broker"], "alpaca_paper")
             self.assertTrue(ds_path.exists())
             self.assertEqual(len(pd.read_csv(ds_path)), 0)
+
+    def test_filter_journal_by_scope_alpaca(self):
+        df = pd.DataFrame([
+            {"broker": "sim", "trade_id": 1},
+            {"broker": "alpaca_paper", "trade_id": 2},
+            {"broker": "alpaca", "trade_id": 3},
+            {"broker": "none", "trade_id": 4},
+        ])
+        out = m.filter_journal_by_scope(df, "alpaca")
+        self.assertEqual(sorted(out["trade_id"].tolist()), [2, 3])
+        sim_only = m.filter_journal_by_scope(df, "sim")
+        self.assertEqual(sorted(sim_only["trade_id"].tolist()), [1, 4])
+        none = m.filter_journal_by_scope(df, "none")
+        self.assertEqual(len(none), 0)
+
+    def test_save_alpaca_scope_strips_sim_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            prev = pd.DataFrame([
+                {
+                    "run_id": "sim1", "trade_id": 1, "ticker_a": "MU", "ticker_b": "WDC",
+                    "basket": "x", "direction": "LONG_SPREAD",
+                    "entry_time": "2026-01-06", "exit_time": "2026-01-07",
+                    "broker": "sim", "status": "CLOSED", "pnl_z": 2.0,
+                    "label": 1, "data_source": "alpaca_live",
+                    **{f"feat_{n}": 0.1 for n in m.FEATURE_NAMES},
+                },
+                {
+                    "run_id": "live1", "trade_id": 1, "ticker_a": "QCOM", "ticker_b": "AVGO",
+                    "basket": "semis", "direction": "SHORT_SPREAD",
+                    "entry_time": "2026-09-15", "exit_time": None,
+                    "broker": "alpaca_paper", "status": "OPEN", "pnl_z": 0.0,
+                    "label": None, "data_source": "alpaca_live",
+                },
+            ])
+            prev.to_csv(tmp_path / "paper_trades.csv", index=False)
+            # Prior training tied to sim journal key
+            pd.DataFrame([{
+                "run_id": "sim1", "trade_id": 1, "ticker_a": "MU", "ticker_b": "WDC",
+                "basket": "x", "label": 1, "data_source": "alpaca_live",
+                **{f"feat_{n}": 0.1 for n in m.FEATURE_NAMES},
+            }]).to_csv(tmp_path / "exit_training_dataset.csv", index=False)
+
+            trade = m.PaperTrade(
+                trade_id=2,
+                direction="LONG_SPREAD",
+                entry_time=pd.Timestamp("2026-09-16"),
+                entry_z=-2.1,
+                entry_spread=1.0,
+                ticker_a="NVDA",
+                ticker_b="AMD",
+                basket="semis",
+                broker="alpaca_paper",
+                status="OPEN",
+            )
+            path, ds_path = m.save_paper_results(
+                [trade],
+                results_dir=tmp_path,
+                data_source="alpaca_live",
+                journal_scope="alpaca",
+            )
+            journal = pd.read_csv(path)
+            self.assertTrue((journal["broker"].astype(str).str.startswith("alpaca")).all())
+            self.assertFalse((journal["broker"] == "sim").any())
+            self.assertEqual(len(journal), 2)  # prior OPEN + new OPEN
+            ds = pd.read_csv(ds_path)
+            # Sim training key purged with sim journal rows
+            self.assertEqual(len(ds), 0)
 
     def test_save_dedupes_polluted_journal_like_results_data(self):
         with tempfile.TemporaryDirectory() as tmp:

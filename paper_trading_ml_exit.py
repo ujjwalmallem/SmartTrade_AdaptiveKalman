@@ -1265,46 +1265,87 @@ def dedupe_journal_rows(
     return df
 
 
+def filter_journal_by_scope(journal: pd.DataFrame, scope: str = "all") -> pd.DataFrame:
+    """
+    scope:
+      all     — keep every broker
+      alpaca  — keep broker starting with 'alpaca' only (real paper fills)
+      sim     — keep local simulator rows only
+      none    — empty frame (caller should skip writing)
+    """
+    scope = (scope or "all").lower().strip()
+    if journal is None or journal.empty:
+        return journal if journal is not None else pd.DataFrame()
+    if scope in ("none", "off", "skip"):
+        return journal.iloc[0:0].copy()
+    if scope == "all":
+        return journal
+    broker = journal["broker"].astype(str) if "broker" in journal.columns else pd.Series([""] * len(journal))
+    if scope == "alpaca":
+        return journal.loc[broker.str.lower().str.startswith("alpaca")].copy()
+    if scope == "sim":
+        return journal.loc[broker.str.lower().isin(["sim", "none", "local", ""])].copy()
+    raise ValueError(f"Unknown journal scope '{scope}'. Use all|alpaca|sim|none.")
+
+
 def save_paper_results(
     closed_trades: Sequence[PaperTrade],
     results_dir: Optional[Path] = None,
     run_id: Optional[str] = None,
     data_source: str = "",
+    journal_scope: str = "all",
+    update_training: bool = True,
 ) -> Tuple[Path, Path]:
     """
-    Append closed trades to a journal CSV and write/append the training dataset.
-    Prior-year windows (e.g. 2025) are purged so only the latest year remains.
-    Wash CLOSED rows and duplicate OPEN adopts are dropped so training stays clean.
-    Returns (trades_csv_path, dataset_csv_path).
+    Append trades to paper_trades.csv and optionally the training dataset.
+
+    journal_scope: all | alpaca | sim | none
+      alpaca — only Alpaca paper rows in paper_trades (strips legacy sim history)
+      none   — do not write paper_trades.csv
     """
     results_dir = Path(results_dir) if results_dir is not None else RESULTS_DIR
     results_dir.mkdir(parents=True, exist_ok=True)
     run_id = run_id or pd.Timestamp.now("UTC").strftime("%Y%m%dT%H%M%SZ")
     year = _latest_allowed_trade_year()
+    scope = (journal_scope or "all").lower().strip()
 
     frame = closed_trades_to_frame(closed_trades, run_id=run_id, data_source=data_source)
     trades_path = results_dir / "paper_trades.csv"
     dataset_path = results_dir / "exit_training_dataset.csv"
 
-    # Full journal (append → year filter for ML → dedupe wash/OPEN spam)
-    if trades_path.exists():
-        prev = pd.read_csv(trades_path)
-        journal = pd.concat([prev, frame], ignore_index=True)
+    journal = pd.DataFrame()
+    if scope not in ("none", "off", "skip"):
+        frame_j = filter_journal_by_scope(frame, scope)
+        if trades_path.exists():
+            prev = pd.read_csv(trades_path)
+            prev = filter_journal_by_scope(prev, scope)
+            journal = pd.concat([prev, frame_j], ignore_index=True)
+        else:
+            journal = frame_j
+        journal = filter_trades_to_latest_year(
+            journal, trade_year=year, require_exit_in_year=False
+        )
+        journal = dedupe_journal_rows(journal, drop_wash=True)
+        journal.to_csv(trades_path, index=False)
+        print(f"\n💾 Saved {len(closed_trades)} new trades → {trades_path} (scope={scope})")
+        print(f"💾 Journal rows kept for {year}: {len(journal)}")
     else:
-        journal = frame
-    journal = filter_trades_to_latest_year(
-        journal, trade_year=year, require_exit_in_year=False
-    )
-    journal = dedupe_journal_rows(journal, drop_wash=True)
-    journal.to_csv(trades_path, index=False)
+        print("\nℹ️  Skipping paper_trades.csv write (journal_scope=none)")
+
+    if not update_training:
+        return trades_path, dataset_path
 
     # Training dataset = feature columns + label (closed trades only)
     feat_cols = [f"feat_{n}" for n in FEATURE_NAMES]
     closed_frame = frame.copy()
     if "status" in closed_frame.columns:
         closed_frame = closed_frame[closed_frame["status"].fillna("CLOSED") == "CLOSED"]
+    # For alpaca journal scope, only train on alpaca closed fills
+    if scope == "alpaca" and "broker" in closed_frame.columns:
+        closed_frame = closed_frame[
+            closed_frame["broker"].astype(str).str.lower().str.startswith("alpaca")
+        ]
     closed_frame = closed_frame.dropna(subset=["label"]) if "label" in closed_frame.columns else closed_frame
-    # OPEN-only saves (live adopt / overnight hold) have no feat_* columns yet
     for col in feat_cols:
         if col not in closed_frame.columns:
             closed_frame[col] = np.nan
@@ -1313,9 +1354,7 @@ def save_paper_results(
         if col not in closed_frame.columns:
             closed_frame[col] = np.nan
     ds = closed_frame[want_cols]
-    # Drop rows missing any feature (e.g. open broker mirrors)
     ds = ds.dropna(subset=feat_cols, how="any")
-    # Also drop wash closed rows from the newly appended training frame
     if not frame.empty and "status" in frame.columns:
         wash_keys = frame.loc[_is_wash_closed_row(frame), ["run_id", "trade_id"]]
         if not wash_keys.empty and {"run_id", "trade_id"}.issubset(ds.columns):
@@ -1324,18 +1363,17 @@ def save_paper_results(
     if dataset_path.exists():
         prev_ds = pd.read_csv(dataset_path)
         ds = pd.concat([prev_ds, ds], ignore_index=True)
-    if not journal.empty and {"run_id", "trade_id"}.issubset(ds.columns):
-        keys = journal[["run_id", "trade_id"]].drop_duplicates()
-        ds = ds.merge(keys, on=["run_id", "trade_id"], how="inner")
-    elif journal.empty:
-        ds = ds.iloc[0:0]
-    # Re-dedupe training rows that survived from older polluted journals
-    if not ds.empty and {"ticker_a", "ticker_b", "run_id", "trade_id"}.issubset(ds.columns):
+    # Tie training rows to journal keys so alpaca scope drops legacy sim labels
+    if scope not in ("none", "off", "skip"):
+        if not journal.empty and {"run_id", "trade_id"}.issubset(ds.columns):
+            keys = journal[["run_id", "trade_id"]].drop_duplicates()
+            ds = ds.merge(keys, on=["run_id", "trade_id"], how="inner")
+        elif journal.empty:
+            # No in-scope journal rows → empty training (e.g. alpaca-only, no fills yet)
+            ds = ds.iloc[0:0]
+    if not ds.empty and {"run_id", "trade_id"}.issubset(ds.columns):
         ds = ds.drop_duplicates(subset=["run_id", "trade_id"], keep="last")
     ds.to_csv(dataset_path, index=False)
-
-    print(f"\n💾 Saved {len(closed_trades)} new trades → {trades_path}")
-    print(f"💾 Journal rows kept for {year}: {len(journal)}")
     print(f"💾 Training dataset rows: {len(ds)} → {dataset_path}")
     return trades_path, dataset_path
 
@@ -2032,6 +2070,7 @@ def run_paper_trading_and_train(
     data_source: str = "auto",
     mode: str = "backtest",
     data_window: str = "multi_year",
+    journal_scope: str = "alpaca",
 ):
     mode = (mode or "backtest").lower().strip()
     if mode not in ("backtest", "live", "research"):
@@ -2183,6 +2222,7 @@ def run_paper_trading_and_train(
     df_out = next(iter(pair_frames.values())) if pair_frames else prices
 
     to_save = list(closed_trades) + list(open_broker_trades)
+    scope = (journal_scope or "alpaca").lower().strip()
 
     if len(closed_trades) < 2:
         if mode == "live":
@@ -2191,15 +2231,22 @@ def run_paper_trading_and_train(
                 "Open Alpaca entries are still journaled when placed/adopted."
             )
             if to_save:
-                save_paper_results(to_save, data_source=data_source)
+                save_paper_results(to_save, data_source=data_source, journal_scope=scope)
             return trader, None, df_out
         print("Not enough trades generated. Try increasing n_bars or relaxing entry thresholds.")
+        # Still persist when explicitly journaling (e.g. alpaca scope with open rows)
+        if to_save and scope not in ("none", "off", "skip"):
+            save_paper_results(to_save, data_source=data_source, journal_scope=scope)
         return trader, None, df_out
 
     # 5. Persist results, then train (from this run + any prior stored history)
-    save_paper_results(to_save, data_source=data_source)
+    save_paper_results(to_save, data_source=data_source, journal_scope=scope)
     print("\nTraining ML Exit Model on stored paper trades...")
-    model = train_from_stored_results()
+    try:
+        model = train_from_stored_results()
+    except ValueError as e:
+        print(f"⚠️ Skipping train this run: {e}")
+        model = None
 
     return trader, model, df_out
 
@@ -2268,14 +2315,31 @@ if __name__ == "__main__":
         action="store_true",
         help="Build Alpaca order payloads without calling the API (for tests)",
     )
+    parser.add_argument(
+        "--save-journal",
+        choices=["alpaca", "all", "sim", "none"],
+        default="alpaca",
+        help=(
+            "What to keep in paper_trades.csv: "
+            "alpaca (default, real paper fills only), all, sim, or none"
+        ),
+    )
     args = parser.parse_args()
 
     if args.mode == "live" and args.broker == "sim":
         print("ℹ️  Live mode with --broker sim will not place Alpaca orders. Use --broker alpaca.")
+    if args.broker == "sim" and args.save_journal == "alpaca":
+        print(
+            "ℹ️  --save-journal alpaca with --broker sim writes no sim rows "
+            "(journal stays Alpaca-only). Use --save-journal all|sim to keep simulator fills."
+        )
 
     if args.train_only:
-        model = train_from_stored_results()
-        print("\n🎯 Retrain complete from stored results.")
+        try:
+            model = train_from_stored_results()
+            print("\n🎯 Retrain complete from stored results.")
+        except ValueError as e:
+            print(f"\n⚠️ Retrain skipped: {e}")
     else:
         trader, model, data = run_paper_trading_and_train(
             n_bars=args.n_bars,
@@ -2290,6 +2354,7 @@ if __name__ == "__main__":
             data_source=args.data_source,
             mode=args.mode,
             data_window=args.data_window,
+            journal_scope=args.save_journal,
         )
 
         if args.mode == "research":
