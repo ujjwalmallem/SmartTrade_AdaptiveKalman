@@ -313,6 +313,36 @@ class TestLatestYearFilter(unittest.TestCase):
         self.assertEqual(len(kept), 2)
         self.assertListEqual(kept["trade_id"].tolist(), [2, 3])
 
+    def test_cross_year_exit_kept_when_not_required(self):
+        df = pd.DataFrame({
+            "entry_time": ["2025-12-30", "2026-01-02"],
+            "exit_time": ["2026-01-02", "2026-01-05"],
+            "trade_id": [1, 2],
+        })
+        loose = m.filter_trades_to_latest_year(
+            df, trade_year=2026, require_exit_in_year=False
+        )
+        strict = m.filter_trades_to_latest_year(
+            df, trade_year=2026, require_exit_in_year=True
+        )
+        # entry in 2025 → dropped either way; entry 2026 kept
+        self.assertEqual(loose["trade_id"].tolist(), [2])
+        self.assertEqual(strict["trade_id"].tolist(), [2])
+        # entry 2026 exit 2027 kept only when exit year not required
+        df2 = pd.DataFrame({
+            "entry_time": ["2026-12-30"],
+            "exit_time": ["2027-01-02"],
+            "trade_id": [9],
+        })
+        self.assertEqual(
+            len(m.filter_trades_to_latest_year(df2, trade_year=2026, require_exit_in_year=False)),
+            1,
+        )
+        self.assertEqual(
+            len(m.filter_trades_to_latest_year(df2, trade_year=2026, require_exit_in_year=True)),
+            0,
+        )
+
 
 class TestEndToEndYfinance(unittest.TestCase):
     def test_paper_session_latest_year_only(self):
@@ -463,29 +493,76 @@ class TestLiveMode(unittest.TestCase):
             {
                 "run_id": "a", "trade_id": 1, "ticker_a": "AAPL", "ticker_b": "MSFT",
                 "direction": "LONG_SPREAD", "entry_time": "2026-04-13", "exit_time": "2026-04-17",
-                "broker": "sim",
+                "broker": "sim", "status": "CLOSED", "pnl_z": 1.0,
             },
             {
                 "run_id": "b", "trade_id": 1, "ticker_a": "AAPL", "ticker_b": "MSFT",
                 "direction": "LONG_SPREAD", "entry_time": "2026-04-13", "exit_time": "2026-04-17",
-                "broker": "sim",
+                "broker": "sim", "status": "CLOSED", "pnl_z": 1.0,
             },
             {
                 "run_id": "c", "trade_id": 1, "ticker_a": "QCOM", "ticker_b": "AVGO",
                 "direction": "SHORT_SPREAD", "entry_time": "2026-09-15", "exit_time": None,
-                "broker": "alpaca_paper",
+                "broker": "alpaca_paper", "status": "OPEN", "pnl_z": 0.0,
             },
             {
                 "run_id": "d", "trade_id": 2, "ticker_a": "QCOM", "ticker_b": "AVGO",
                 "direction": "SHORT_SPREAD", "entry_time": "2026-09-15", "exit_time": None,
-                "broker": "alpaca_paper",
+                "broker": "alpaca_paper", "status": "OPEN", "pnl_z": 0.0,
             },
         ])
         out = m.dedupe_journal_rows(df)
         sim_rows = out[out["broker"] == "sim"]
         alpaca_rows = out[out["broker"] == "alpaca_paper"]
         self.assertEqual(len(sim_rows), 1)
-        self.assertEqual(len(alpaca_rows), 2)
+        self.assertEqual(len(alpaca_rows), 1)
+        self.assertEqual(alpaca_rows.iloc[0]["run_id"], "d")
+
+    def test_dedupe_drops_wash_keeps_open(self):
+        df = pd.DataFrame([
+            {
+                "run_id": "w", "trade_id": 1, "ticker_a": "QCOM", "ticker_b": "AVGO",
+                "direction": "SHORT_SPREAD",
+                "entry_time": "2026-09-15 04:00:00", "exit_time": "2026-09-15 04:00:00",
+                "broker": "alpaca_paper", "status": "CLOSED", "pnl_z": 0.0,
+            },
+            {
+                "run_id": "o1", "trade_id": 1, "ticker_a": "QCOM", "ticker_b": "AVGO",
+                "direction": "SHORT_SPREAD",
+                "entry_time": "2026-09-15 04:00:00", "exit_time": None,
+                "broker": "alpaca_paper", "status": "OPEN", "pnl_z": 0.0,
+            },
+            {
+                "run_id": "o2", "trade_id": 1, "ticker_a": "QCOM", "ticker_b": "AVGO",
+                "direction": "SHORT_SPREAD",
+                "entry_time": "2026-09-15 04:00:00", "exit_time": None,
+                "broker": "alpaca_paper", "status": "OPEN", "pnl_z": 0.0,
+            },
+        ])
+        out = m.dedupe_journal_rows(df, drop_wash=True)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out.iloc[0]["status"], "OPEN")
+        self.assertEqual(out.iloc[0]["run_id"], "o2")
+
+    def test_dedupe_prefers_real_closed_over_open(self):
+        df = pd.DataFrame([
+            {
+                "run_id": "o", "trade_id": 1, "ticker_a": "AAPL", "ticker_b": "MSFT",
+                "direction": "LONG_SPREAD",
+                "entry_time": "2026-04-13", "exit_time": None,
+                "broker": "alpaca_paper", "status": "OPEN", "pnl_z": 0.0,
+            },
+            {
+                "run_id": "c", "trade_id": 1, "ticker_a": "AAPL", "ticker_b": "MSFT",
+                "direction": "LONG_SPREAD",
+                "entry_time": "2026-04-13", "exit_time": "2026-04-17",
+                "broker": "alpaca_paper", "status": "CLOSED", "pnl_z": 1.2,
+            },
+        ])
+        out = m.dedupe_journal_rows(df, drop_wash=True)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out.iloc[0]["status"], "CLOSED")
+        self.assertEqual(out.iloc[0]["run_id"], "c")
 
     def test_save_open_only_trades_does_not_crash(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -511,6 +588,53 @@ class TestLiveMode(unittest.TestCase):
             self.assertEqual(journal.iloc[0]["broker"], "alpaca_paper")
             self.assertTrue(ds_path.exists())
             self.assertEqual(len(pd.read_csv(ds_path)), 0)
+
+    def test_save_dedupes_polluted_journal_like_results_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            # Simulate the 19-row pollution: 4 sim + wash CLOSED + many OPEN adopts
+            rows = []
+            for i, (a, b, entry, exit_) in enumerate([
+                ("MU", "WDC", "2026-01-06", "2026-01-07"),
+                ("NVDA", "AMD", "2026-01-13", "2026-01-15"),
+                ("MSFT", "ORCL", "2026-03-11", "2026-03-12"),
+                ("AAPL", "MSFT", "2026-04-13", "2026-04-17"),
+            ], start=1):
+                rows.append({
+                    "run_id": "sim1", "trade_id": i, "ticker_a": a, "ticker_b": b,
+                    "basket": "x", "direction": "LONG_SPREAD",
+                    "entry_time": entry, "exit_time": exit_,
+                    "broker": "sim", "status": "CLOSED", "pnl_z": 2.0,
+                    "label": 1, "data_source": "alpaca_live",
+                    **{f"feat_{n}": 0.1 for n in m.FEATURE_NAMES},
+                })
+            rows.append({
+                "run_id": "wash", "trade_id": 1, "ticker_a": "QCOM", "ticker_b": "AVGO",
+                "basket": "semis", "direction": "SHORT_SPREAD",
+                "entry_time": "2026-09-15 04:00:00", "exit_time": "2026-09-15 04:00:00",
+                "broker": "alpaca_paper", "status": "CLOSED", "pnl_z": 0.0,
+                "label": 0, "data_source": "alpaca_live",
+                **{f"feat_{n}": 0.1 for n in m.FEATURE_NAMES},
+            })
+            for i in range(14):
+                rows.append({
+                    "run_id": f"open{i}", "trade_id": 1, "ticker_a": "QCOM", "ticker_b": "AVGO",
+                    "basket": "semis", "direction": "SHORT_SPREAD",
+                    "entry_time": "2026-09-15 04:00:00", "exit_time": None,
+                    "broker": "alpaca_paper", "status": "OPEN", "pnl_z": 0.0,
+                    "label": None, "data_source": "alpaca_live",
+                })
+            pd.DataFrame(rows).to_csv(tmp_path / "paper_trades.csv", index=False)
+            # Append nothing new — just run save path via empty closed list by calling dedupe on loaded
+            prev = pd.read_csv(tmp_path / "paper_trades.csv")
+            cleaned = m.dedupe_journal_rows(
+                m.filter_trades_to_latest_year(prev, trade_year=2026, require_exit_in_year=False),
+                drop_wash=True,
+            )
+            self.assertEqual(len(cleaned), 5)  # 4 sim + 1 OPEN
+            self.assertEqual((cleaned["broker"] == "sim").sum(), 4)
+            self.assertEqual((cleaned["status"] == "OPEN").sum(), 1)
+            self.assertFalse(((cleaned["status"] == "CLOSED") & (cleaned["ticker_a"] == "QCOM")).any())
 
 class TestAlpacaDataPrimary(unittest.TestCase):
     def test_alpaca_primary_path_with_mock(self):

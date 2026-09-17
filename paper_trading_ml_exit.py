@@ -1202,10 +1202,30 @@ def _trade_fingerprint_cols() -> List[str]:
     return ["ticker_a", "ticker_b", "direction", "entry_time", "exit_time", "broker"]
 
 
-def dedupe_journal_rows(journal: pd.DataFrame) -> pd.DataFrame:
+def _is_wash_closed_row(df: pd.DataFrame) -> pd.Series:
+    """Same-bar CLOSED with zero pnl_z (failed/instant reverse, not a real round-trip)."""
+    if df.empty:
+        return pd.Series(dtype=bool)
+    status = df["status"].astype(str).str.upper() if "status" in df.columns else pd.Series([""] * len(df))
+    entry = pd.to_datetime(df["entry_time"], format="mixed", errors="coerce")
+    exit_ = pd.to_datetime(df["exit_time"], format="mixed", errors="coerce")
+    pnl = pd.to_numeric(df["pnl_z"], errors="coerce") if "pnl_z" in df.columns else pd.Series(np.nan, index=df.index)
+    same_bar = entry.notna() & exit_.notna() & (entry == exit_)
+    zero_pnl = pnl.fillna(0.0).abs() < 1e-12
+    return status.eq("CLOSED") & same_bar & zero_pnl
+
+
+def dedupe_journal_rows(
+    journal: pd.DataFrame,
+    drop_wash: bool = True,
+) -> pd.DataFrame:
     """
-    Drop repeated sim backtest replays (same pair/entry/exit/broker).
-    Keep alpaca_* rows intact (including OPEN with null exit_time).
+    Deduplicate journal rows for sim *and* alpaca.
+
+    - drop_wash=True: remove CLOSED wash trades (entry_time == exit_time, pnl_z ≈ 0)
+      so a later OPEN for the same exposure is kept (matches brokerage).
+    - For a real close (entry != exit), CLOSED outranks OPEN on the same pair/entry.
+    - Repeated sim backtest fingerprints collapse to one row.
     """
     if journal is None or journal.empty:
         return journal
@@ -1213,20 +1233,36 @@ def dedupe_journal_rows(journal: pd.DataFrame) -> pd.DataFrame:
     for col in ("entry_time", "exit_time"):
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], format="mixed", errors="coerce")
-    broker = df["broker"].astype(str) if "broker" in df.columns else pd.Series([""] * len(df))
-    is_sim = broker.str.lower().isin(["sim", "none", "local", ""])
-    cols = [c for c in _trade_fingerprint_cols() if c in df.columns]
-    if not cols:
-        return df
-    sim = df.loc[is_sim]
-    other = df.loc[~is_sim]
-    if not sim.empty:
-        sim = sim.drop_duplicates(subset=cols, keep="last")
-    out = pd.concat([sim, other], ignore_index=True)
-    sort_cols = [c for c in ("entry_time", "run_id", "trade_id") if c in out.columns]
+
+    if drop_wash and {"entry_time", "exit_time", "status"}.issubset(df.columns):
+        wash = _is_wash_closed_row(df)
+        n_wash = int(wash.sum())
+        if n_wash:
+            print(f"⚠️  Dropped {n_wash} wash CLOSED rows (entry==exit, pnl_z≈0)")
+            df = df.loc[~wash].copy()
+
+    # Collapse identical fingerprints (includes exit_time when present)
+    fp = [c for c in _trade_fingerprint_cols() if c in df.columns]
+    if fp:
+        df = df.drop_duplicates(subset=fp, keep="last")
+
+    # Same pair + entry_time: prefer real CLOSED over OPEN; then latest run_id
+    key = [c for c in ("ticker_a", "ticker_b", "entry_time") if c in df.columns]
+    if len(key) == 3 and "status" in df.columns:
+        status = df["status"].astype(str).str.upper()
+        df = df.assign(_rank=np.where(status.eq("CLOSED"), 1, 0))
+        sort_cols = key + ["_rank"]
+        if "run_id" in df.columns:
+            sort_cols.append("run_id")
+        df = df.sort_values(sort_cols, kind="mergesort")
+        df = df.drop_duplicates(subset=key, keep="last").drop(columns=["_rank"])
+
+    sort_cols = [c for c in ("entry_time", "run_id", "trade_id") if c in df.columns]
     if sort_cols:
-        out = out.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
-    return out
+        df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+    else:
+        df = df.reset_index(drop=True)
+    return df
 
 
 def save_paper_results(
@@ -1238,7 +1274,7 @@ def save_paper_results(
     """
     Append closed trades to a journal CSV and write/append the training dataset.
     Prior-year windows (e.g. 2025) are purged so only the latest year remains.
-    Repeated sim backtest rows (same pair/entry/exit) are deduped.
+    Wash CLOSED rows and duplicate OPEN adopts are dropped so training stays clean.
     Returns (trades_csv_path, dataset_csv_path).
     """
     results_dir = Path(results_dir) if results_dir is not None else RESULTS_DIR
@@ -1250,14 +1286,16 @@ def save_paper_results(
     trades_path = results_dir / "paper_trades.csv"
     dataset_path = results_dir / "exit_training_dataset.csv"
 
-    # Full journal (append, then keep latest year only, then dedupe sim replays)
+    # Full journal (append → year filter for ML → dedupe wash/OPEN spam)
     if trades_path.exists():
         prev = pd.read_csv(trades_path)
         journal = pd.concat([prev, frame], ignore_index=True)
     else:
         journal = frame
-    journal = filter_trades_to_latest_year(journal, trade_year=year)
-    journal = dedupe_journal_rows(journal)
+    journal = filter_trades_to_latest_year(
+        journal, trade_year=year, require_exit_in_year=False
+    )
+    journal = dedupe_journal_rows(journal, drop_wash=True)
     journal.to_csv(trades_path, index=False)
 
     # Training dataset = feature columns + label (closed trades only)
@@ -1277,6 +1315,12 @@ def save_paper_results(
     ds = closed_frame[want_cols]
     # Drop rows missing any feature (e.g. open broker mirrors)
     ds = ds.dropna(subset=feat_cols, how="any")
+    # Also drop wash closed rows from the newly appended training frame
+    if not frame.empty and "status" in frame.columns:
+        wash_keys = frame.loc[_is_wash_closed_row(frame), ["run_id", "trade_id"]]
+        if not wash_keys.empty and {"run_id", "trade_id"}.issubset(ds.columns):
+            ds = ds.merge(wash_keys.drop_duplicates(), on=["run_id", "trade_id"], how="left", indicator=True)
+            ds = ds.loc[ds["_merge"] == "left_only"].drop(columns=["_merge"])
     if dataset_path.exists():
         prev_ds = pd.read_csv(dataset_path)
         ds = pd.concat([prev_ds, ds], ignore_index=True)
@@ -1285,6 +1329,9 @@ def save_paper_results(
         ds = ds.merge(keys, on=["run_id", "trade_id"], how="inner")
     elif journal.empty:
         ds = ds.iloc[0:0]
+    # Re-dedupe training rows that survived from older polluted journals
+    if not ds.empty and {"ticker_a", "ticker_b", "run_id", "trade_id"}.issubset(ds.columns):
+        ds = ds.drop_duplicates(subset=["run_id", "trade_id"], keep="last")
     ds.to_csv(dataset_path, index=False)
 
     print(f"\n💾 Saved {len(closed_trades)} new trades → {trades_path}")
@@ -1301,15 +1348,26 @@ def _latest_allowed_trade_year(now: Optional[pd.Timestamp] = None) -> int:
 def filter_trades_to_latest_year(
     trades: pd.DataFrame,
     trade_year: Optional[int] = None,
+    require_exit_in_year: bool = False,
 ) -> pd.DataFrame:
-    """Keep only rows whose entry (and exit, if closed) fall in the latest calendar year."""
+    """
+    Keep rows whose entry falls in trade_year.
+
+    require_exit_in_year=False (default, ML/training): exit may be missing or
+    spill into the next calendar year.
+    require_exit_in_year=True (year-end reporting): closed trades must also
+    exit in the same calendar year.
+    """
     if trades.empty:
         return trades
     year = trade_year if trade_year is not None else _latest_allowed_trade_year()
     entry = pd.to_datetime(trades["entry_time"], format="mixed")
     exit_ = pd.to_datetime(trades["exit_time"], format="mixed", errors="coerce")
     open_ok = exit_.isna() & entry.dt.year.eq(year)
-    closed_ok = exit_.notna() & entry.dt.year.eq(year) & exit_.dt.year.eq(year)
+    if require_exit_in_year:
+        closed_ok = exit_.notna() & entry.dt.year.eq(year) & exit_.dt.year.eq(year)
+    else:
+        closed_ok = exit_.notna() & entry.dt.year.eq(year)
     mask = open_ok | closed_ok
     kept = trades.loc[mask].copy()
     dropped = len(trades) - len(kept)
@@ -1361,7 +1419,9 @@ def load_training_dataset(
         tpath = Path(trades_path)
         if tpath.exists() and {"run_id", "trade_id"}.issubset(ds.columns):
             journal = pd.read_csv(tpath)
-            journal = filter_trades_to_latest_year(journal, trade_year=year)
+            journal = filter_trades_to_latest_year(
+                journal, trade_year=year, require_exit_in_year=False
+            )
             keys = journal[["run_id", "trade_id"]].drop_duplicates()
             before = len(ds)
             ds = ds.merge(keys, on=["run_id", "trade_id"], how="inner")
@@ -1370,7 +1430,9 @@ def load_training_dataset(
                 print(f"⚠️  Dropped {dropped} training rows not in latest year {year}")
         elif "entry_time" in ds.columns and "exit_time" in ds.columns:
             before = len(ds)
-            ds = filter_trades_to_latest_year(ds, trade_year=year)
+            ds = filter_trades_to_latest_year(
+                ds, trade_year=year, require_exit_in_year=False
+            )
             dropped = before - len(ds)
             if dropped:
                 print(f"⚠️  Dropped {dropped} training rows outside year {year}")
