@@ -804,6 +804,64 @@ class TestLiveMode(unittest.TestCase):
             self.assertEqual((cleaned["status"] == "OPEN").sum(), 1)
             self.assertFalse(((cleaned["status"] == "CLOSED") & (cleaned["ticker_a"] == "QCOM")).any())
 
+    def test_prune_journal_strips_sim_for_alpaca_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pd.DataFrame([
+                {
+                    "run_id": "s", "trade_id": 1, "ticker_a": "AAPL", "ticker_b": "MSFT",
+                    "direction": "LONG_SPREAD", "entry_time": "2026-04-13",
+                    "exit_time": "2026-04-17", "broker": "sim", "status": "CLOSED", "pnl_z": 1.0,
+                },
+                {
+                    "run_id": "a", "trade_id": 1, "ticker_a": "QCOM", "ticker_b": "AVGO",
+                    "direction": "SHORT_SPREAD", "entry_time": "2026-09-15",
+                    "exit_time": None, "broker": "alpaca_paper", "status": "OPEN", "pnl_z": 0.0,
+                },
+            ]).to_csv(tmp_path / "paper_trades.csv", index=False)
+            m.prune_journal_to_scope(tmp_path, journal_scope="alpaca")
+            out = pd.read_csv(tmp_path / "paper_trades.csv")
+            self.assertEqual(len(out), 1)
+            self.assertTrue(str(out.iloc[0]["broker"]).startswith("alpaca"))
+
+    def test_replace_training_overwrites_dataset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            old = {
+                "run_id": "old", "trade_id": 99, "ticker_a": "X", "ticker_b": "Y",
+                "basket": "mag7", "label": 0,
+                **{f"feat_{n}": 0.0 for n in m.FEATURE_NAMES},
+            }
+            pd.DataFrame([old]).to_csv(tmp_path / "exit_training_dataset.csv", index=False)
+            trade = m.PaperTrade(
+                trade_id=1,
+                direction="LONG_SPREAD",
+                entry_time=pd.Timestamp("2026-04-13"),
+                entry_z=-2.2,
+                entry_spread=1.0,
+                exit_time=pd.Timestamp("2026-04-17"),
+                exit_z=-0.3,
+                bars_held=4,
+                pnl_z=1.5,
+                status="CLOSED",
+                ticker_a="AAPL",
+                ticker_b="MSFT",
+                basket="mag7",
+                broker="sim",
+                exit_features=np.full(len(m.FEATURE_NAMES), 0.2),
+            )
+            _, ds_path = m.save_paper_results(
+                [trade],
+                results_dir=tmp_path,
+                journal_scope="none",
+                replace_training=True,
+            )
+            ds = pd.read_csv(ds_path)
+            self.assertEqual(len(ds), 1)
+            self.assertEqual(int(ds.iloc[0]["trade_id"]), 1)
+            self.assertNotIn(99, set(ds["trade_id"].tolist()))
+
+
 class TestAlpacaDataPrimary(unittest.TestCase):
     def test_alpaca_primary_path_with_mock(self):
         import types

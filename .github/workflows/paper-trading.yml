@@ -81,8 +81,26 @@ jobs:
             echo "   Add ALPACA_API_KEY and ALPACA_API_SECRET_KEY under Repo Settings → Secrets"
           fi
 
+      - name: Harvest training labels (sim backtest → dataset only)
+        # Live Alpaca only moves one bar/day; without a harvest, results-data
+        # stays stuck at a handful of rows and train never reaches min_samples.
+        # Does NOT write paper_trades.csv (save-journal none).
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+          APCA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY }}
+          APCA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          echo "--- Harvest exit_training_dataset.csv (replace; journal untouched) ---"
+          python paper_trading_ml_exit.py \
+            --harvest-training \
+            --data-source auto \
+            --n-bars 700 \
+            --min-trades 80
+
       - name: Retrain from stored results
-        # Soft: live journals may have OPEN-only rows until first real closes
+        # Soft: harvest may still be thin on a bad data day
         continue-on-error: true
         run: python paper_trading_ml_exit.py --train-only
 

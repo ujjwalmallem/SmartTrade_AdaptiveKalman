@@ -27,6 +27,8 @@ PYTHONPATH=. python -m src.train_exit_model --results-dir results
 
 **Journal (`--save-journal`):** default **`alpaca`** — `paper_trades.csv` keeps Alpaca paper fills only (legacy sim rows are stripped on save). Use `all` / `sim` for local experiments, or `none` to skip the journal write.
 
+**Training harvest (`--harvest-training`):** sim backtest that **replaces** `exit_training_dataset.csv` without touching the Alpaca journal. CI runs this so the dataset can reach ≥50 labels even while live paper only moves one bar per day.
+
 **Brokerage:** default is a local simulator. With `--broker alpaca`, entry/exit on the **latest bar only** are submitted to the Alpaca **paper** API (never live).
 
 ### GitHub Secrets (recommended for CI)

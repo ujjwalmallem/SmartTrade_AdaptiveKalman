@@ -998,6 +998,7 @@ def save_paper_results(
     data_source: str = "",
     journal_scope: str = "all",
     update_training: bool = True,
+    replace_training: bool = False,
 ) -> Tuple[Path, Path]:
     """
     Append trades to paper_trades.csv and optionally the training dataset.
@@ -1005,6 +1006,9 @@ def save_paper_results(
     journal_scope: all | alpaca | sim | none
       alpaca — only Alpaca paper rows in paper_trades (strips legacy sim history)
       none   — do not write paper_trades.csv
+
+    replace_training: if True, overwrite exit_training_dataset.csv from this
+      batch only (used by CI harvest; avoids forever-stale 4-row datasets).
     """
     results_dir = Path(results_dir) if results_dir is not None else RESULTS_DIR
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -1063,11 +1067,14 @@ def save_paper_results(
         if not wash_keys.empty and {"run_id", "trade_id"}.issubset(ds.columns):
             ds = ds.merge(wash_keys.drop_duplicates(), on=["run_id", "trade_id"], how="left", indicator=True)
             ds = ds.loc[ds["_merge"] == "left_only"].drop(columns=["_merge"])
-    if dataset_path.exists():
+    if replace_training:
+        # Fresh harvest — do not concat stale prev rows
+        pass
+    elif dataset_path.exists():
         prev_ds = pd.read_csv(dataset_path)
         ds = pd.concat([prev_ds, ds], ignore_index=True)
     # Tie training rows to journal keys so alpaca scope drops legacy sim labels
-    if scope not in ("none", "off", "skip"):
+    if scope not in ("none", "off", "skip") and not replace_training:
         if not journal.empty and {"run_id", "trade_id"}.issubset(ds.columns):
             keys = journal[["run_id", "trade_id"]].drop_duplicates()
             ds = ds.merge(keys, on=["run_id", "trade_id"], how="inner")
@@ -1076,9 +1083,36 @@ def save_paper_results(
             ds = ds.iloc[0:0]
     if not ds.empty and {"run_id", "trade_id"}.issubset(ds.columns):
         ds = ds.drop_duplicates(subset=["run_id", "trade_id"], keep="last")
+    # Fingerprint dedupe for harvest batches (stable across re-runs)
+    fp = [c for c in ("ticker_a", "ticker_b", "feat_abs_entry_z", "feat_bars_held", "feat_exit_z", "label") if c in ds.columns]
+    if not ds.empty and len(fp) >= 4:
+        ds = ds.drop_duplicates(subset=fp, keep="last")
     ds.to_csv(dataset_path, index=False)
-    print(f"💾 Training dataset rows: {len(ds)} → {dataset_path}")
+    print(f"💾 Training dataset rows: {len(ds)} → {dataset_path}"
+          f"{' (replaced)' if replace_training else ''}")
     return trades_path, dataset_path
+
+
+def prune_journal_to_scope(
+    results_dir: Optional[Path] = None,
+    journal_scope: str = "alpaca",
+) -> Path:
+    """Rewrite paper_trades.csv to the given broker scope (no new trades)."""
+    results_dir = Path(results_dir) if results_dir is not None else RESULTS_DIR
+    trades_path = results_dir / "paper_trades.csv"
+    scope = (journal_scope or "alpaca").lower().strip()
+    if scope in ("none", "off", "skip") or not trades_path.exists():
+        return trades_path
+    year = _latest_allowed_trade_year()
+    prev = pd.read_csv(trades_path)
+    journal = filter_journal_by_scope(prev, scope)
+    journal = filter_trades_to_latest_year(
+        journal, trade_year=year, require_exit_in_year=False
+    )
+    journal = dedupe_journal_rows(journal, drop_wash=True)
+    journal.to_csv(trades_path, index=False)
+    print(f"💾 Pruned journal to scope={scope}: {len(journal)} rows → {trades_path}")
+    return trades_path
 
 
 def _latest_allowed_trade_year(now: Optional[pd.Timestamp] = None) -> int:
@@ -1859,6 +1893,7 @@ def run_paper_trading_and_train(
     mode: str = "backtest",
     data_window: str = "multi_year",
     journal_scope: str = "alpaca",
+    replace_training: bool = False,
 ):
     mode = (mode or "backtest").lower().strip()
     if mode not in ("backtest", "live", "research"):
@@ -1888,6 +1923,8 @@ def run_paper_trading_and_train(
     else:
         print("Backtest: replay history for the ML journal (Alpaca orders only if a fill hits latest bar)")
         print("Goal: Complete at least", min_trades, "round-trip trades\n")
+        if replace_training:
+            print("Harvest: replace exit_training_dataset.csv (paper_trades untouched if scope=none)\n")
 
     # 0. Universe — Mag7, semis, memory, hyperscaler
     baskets = list(baskets) if baskets is not None else list(TICKER_UNIVERSES.keys())
@@ -1970,7 +2007,7 @@ def run_paper_trading_and_train(
         opened = _trade_pair_session(
             trader, df, pair,
             min_trades=min_trades,
-            trades_remaining=(1 if mode == "backtest" else max(1, min_trades - closed_count)),
+            trades_remaining=max(1, min_trades - closed_count),
             trade_year=trade_year,
             model=model,
             ml_threshold=ml_threshold,
@@ -2008,16 +2045,43 @@ def run_paper_trading_and_train(
                 "Open Alpaca entries are still journaled when placed/adopted."
             )
             if to_save:
-                save_paper_results(to_save, data_source=data_source, journal_scope=scope)
+                save_paper_results(
+                    to_save,
+                    data_source=data_source,
+                    journal_scope=scope,
+                    update_training=False,
+                )
+            else:
+                # Still strip legacy sim rows so results-data does not stay polluted
+                prune_journal_to_scope(journal_scope=scope)
             return trader, exit_manager, df_out
         print("Not enough trades generated. Try increasing n_bars or relaxing entry thresholds.")
         # Still persist when explicitly journaling (e.g. alpaca scope with open rows)
-        if to_save and scope not in ("none", "off", "skip"):
-            save_paper_results(to_save, data_source=data_source, journal_scope=scope)
+        # or when harvesting training labels from a thin backtest batch.
+        if to_save:
+            save_paper_results(
+                to_save,
+                data_source=data_source,
+                journal_scope=("none" if replace_training else scope),
+                update_training=True,
+                replace_training=replace_training,
+            )
+        elif scope not in ("none", "off", "skip"):
+            prune_journal_to_scope(journal_scope=scope)
         return trader, exit_manager, df_out
 
     # 5. Persist results, then train sklearn exit model when enough labels exist
-    save_paper_results(to_save, data_source=data_source, journal_scope=scope)
+    save_paper_results(
+        to_save,
+        data_source=data_source,
+        journal_scope=scope,
+        replace_training=replace_training,
+    )
+    if replace_training or scope in ("none", "off", "skip"):
+        # Harvest path: training file updated; optional train below via --train-only in CI
+        print(f"\nHarvest closed trades this run: {len(closed_trades)}")
+        return trader, exit_manager, df_out
+
     print("\nTraining ML Exit Model on stored paper trades...")
     try:
         train_from_stored_results()
@@ -2105,7 +2169,33 @@ if __name__ == "__main__":
             "alpaca (default, real paper fills only), all, sim, or none"
         ),
     )
+    parser.add_argument(
+        "--harvest-training",
+        action="store_true",
+        help=(
+            "Backtest harvest: rewrite exit_training_dataset.csv from sim closes "
+            "without touching paper_trades (implies --mode backtest --broker sim "
+            "--save-journal none --replace-training)"
+        ),
+    )
+    parser.add_argument(
+        "--replace-training",
+        action="store_true",
+        help="Overwrite exit_training_dataset.csv from this run (no append)",
+    )
     args = parser.parse_args()
+
+    if args.harvest_training:
+        args.mode = "backtest"
+        args.broker = "sim"
+        args.save_journal = "none"
+        args.replace_training = True
+        if args.min_trades < 50:
+            args.min_trades = 80
+        print(
+            f"🌾 Harvest training: backtest sim → replace dataset "
+            f"(min_trades={args.min_trades}, journal untouched)"
+        )
 
     if args.mode == "live" and args.broker == "sim":
         print("ℹ️  Live mode with --broker sim will not place Alpaca orders. Use --broker alpaca.")
@@ -2139,6 +2229,7 @@ if __name__ == "__main__":
             mode=args.mode,
             data_window=args.data_window,
             journal_scope=args.save_journal,
+            replace_training=args.replace_training,
         )
 
         if args.mode == "research":
