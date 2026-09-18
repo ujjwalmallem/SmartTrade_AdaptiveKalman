@@ -41,6 +41,8 @@ from src.config import (
     kalman_settings,
 )
 from src.kalman import AdaptiveKalmanPairs, KalmanNoiseModel
+from src.half_life import estimate_half_life
+from src.harvest import harvest_training_dataset
 from src.journal import (
     dedupe_journal_rows,
     filter_journal_by_scope,
@@ -520,25 +522,7 @@ def analyze_feature_importance(model, feature_names):
 # ============================================================
 # RESULTS STORAGE + TRAINING FROM HISTORY
 # ============================================================
-
-def estimate_half_life(spread: pd.Series, lookback: int = 40) -> float:
-    """
-    Ornstein-Uhlenbeck style half-life (in bars).
-    Returns a large number when the spread is not mean-reverting.
-    """
-    if len(spread) < lookback + 5:
-        return 30.0
-    s = spread.iloc[-lookback:].astype(float)
-    lag = s.shift(1).dropna()
-    delta = s.diff().dropna()
-    lag = lag.iloc[-len(delta):]
-    if float(lag.std()) < 1e-8:
-        return 30.0
-    beta = float(np.polyfit(lag.values, delta.values, 1)[0])
-    if beta >= 0:
-        return 60.0
-    hl = np.log(2) / abs(beta)
-    return float(np.clip(hl, 2.0, 60.0))
+# estimate_half_life → src.half_life (AR(1) with lookback=80)
 
 
 def extract_exit_features(
@@ -753,7 +737,7 @@ def _simulate_setups_for_pair(
                 entry_spread=float(row["spread"]),
                 highest_favorable_z=0.0,
             )
-            half_life = estimate_half_life(df["spread"].iloc[: i + 1], lookback=40)
+            half_life = estimate_half_life(df["spread"].iloc[: i + 1], lookback=80)
             features = {
                 "vol": float(row.get("spread_vol", 1.0)),
                 "pnl_proxy": 0.0,
@@ -769,7 +753,7 @@ def _simulate_setups_for_pair(
         # ----- EXIT (exact live helpers) -----
         bars_held = i - entry_idx
         pos_state.bars_held = bars_held
-        half_life = estimate_half_life(df["spread"].iloc[: i + 1], lookback=40)
+        half_life = estimate_half_life(df["spread"].iloc[: i + 1], lookback=80)
         feat_vec = extract_exit_features(
             pos_state, row, bars_held, position, half_life=half_life
         )
@@ -1783,7 +1767,7 @@ def _trade_pair_session(
             pos_state.bars_held = bars_held
 
             # Live half-life of the spread (mean-reversion speed)
-            half_life = estimate_half_life(df["spread"].iloc[: i + 1], lookback=40)
+            half_life = estimate_half_life(df["spread"].iloc[: i + 1], lookback=80)
 
             # Exact feature vector the model will see
             features = extract_exit_features(
@@ -2104,6 +2088,74 @@ def run_paper_trading_and_train(
 # ============================================================
 # RUN IT
 # ============================================================
+
+
+def run_path_label_harvest(
+    n_bars: int = 700,
+    baskets: Optional[Sequence[str]] = None,
+    include_cross: bool = True,
+    max_pairs_per_basket: int = 6,
+    noise_model: KalmanNoiseModel | str = KalmanNoiseModel.STANDARD,
+    data_source: str = "auto",
+) -> Path:
+    """
+    SYSTEM_SPEC §3.1 harvest: per-bar path labels → exit_training_dataset.csv.
+    Does not write paper_trades.csv.
+    """
+    print("🌾 Path-label training harvest (lookahead H=2.5×hl, journal untouched)")
+    baskets = list(baskets) if baskets is not None else list(TICKER_UNIVERSES.keys())
+    pairs = build_pair_universe(
+        baskets=baskets,
+        include_cross=include_cross,
+        max_pairs_per_basket=max_pairs_per_basket,
+    )
+    summarize_universes(pairs)
+    tickers = all_universe_tickers(baskets)
+    panels, source = _load_prices_for_universe(tickers, n_bars, data_source=data_source)
+    trade_year = int(
+        next(iter(panels.values())).attrs.get(
+            "trade_year", pd.Timestamp(next(iter(panels.values())).index.max()).year
+        )
+    )
+    fields = ohlcv_field_panels(panels)
+    prices = fields["close"]
+    highs = fields["high"]
+    lows = fields["low"]
+    volumes = fields["volume"]
+    if isinstance(noise_model, str):
+        noise_model = KalmanNoiseModel(noise_model)
+    print(f"Price panel: {prices.shape[1]}×{prices.shape[0]}  [{source}]  year={trade_year}")
+    print(f"Kalman R mode: {noise_model.value}")
+
+    kf = build_kalman(noise_model=noise_model)
+    pair_frames: Dict[str, Tuple[pd.DataFrame, str, str, str]] = {}
+    for pair in pairs:
+        if pair.ticker_a not in prices.columns or pair.ticker_b not in prices.columns:
+            continue
+        vol_a = volumes[pair.ticker_a] if pair.ticker_a in volumes.columns else None
+        hi_a = highs[pair.ticker_a] if pair.ticker_a in highs.columns else None
+        lo_a = lows[pair.ticker_a] if pair.ticker_a in lows.columns else None
+        df = kf.filter_pair(
+            prices[pair.ticker_a],
+            prices[pair.ticker_b],
+            volume=vol_a,
+            high=hi_a,
+            low=lo_a,
+        )
+        pair_frames[pair.label] = (df, pair.ticker_a, pair.ticker_b, pair.basket)
+
+    out, framed = harvest_training_dataset(
+        pair_frames,
+        results_dir=RESULTS_DIR,
+        data_source=f"{source}_path_harvest",
+    )
+    print(f"   pairs scanned: {len(pair_frames)}")
+    print(f"   labeled bars:  {len(framed)}")
+    print(f"   dataset:       {out}")
+    print("   paper_trades.csv untouched")
+    return out
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -2181,9 +2233,8 @@ if __name__ == "__main__":
         "--harvest-training",
         action="store_true",
         help=(
-            "Backtest harvest: rewrite exit_training_dataset.csv from sim closes "
-            "without touching paper_trades (implies --mode backtest --broker sim "
-            "--save-journal none --replace-training)"
+            "Path-label harvest (SYSTEM_SPEC §3.1): rewrite exit_training_dataset.csv "
+            "from per-bar lookahead labels; does not touch paper_trades.csv"
         ),
     )
     parser.add_argument(
@@ -2193,21 +2244,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.harvest_training:
-        args.mode = "backtest"
-        args.broker = "sim"
-        args.save_journal = "none"
-        args.replace_training = True
-        if args.min_trades < 50:
-            args.min_trades = 80
-        print(
-            f"🌾 Harvest training: backtest sim → replace dataset "
-            f"(min_trades={args.min_trades}, journal untouched, hard-stops only)"
-        )
-
     if args.mode == "live" and args.broker == "sim":
         print("ℹ️  Live mode with --broker sim will not place Alpaca orders. Use --broker alpaca.")
-    if args.broker == "sim" and args.save_journal == "alpaca":
+    if args.broker == "sim" and args.save_journal == "alpaca" and not args.harvest_training:
         print(
             "ℹ️  --save-journal alpaca with --broker sim writes no sim rows "
             "(journal stays Alpaca-only). Use --save-journal all|sim to keep simulator fills."
@@ -2219,12 +2258,19 @@ if __name__ == "__main__":
             print("\n🎯 Retrain complete → models/logistic_exit_model.pkl")
         except ValueError as e:
             print(f"\n⚠️ Retrain skipped: {e}")
+    elif args.harvest_training:
+        run_path_label_harvest(
+            n_bars=args.n_bars,
+            baskets=["mag7", "semis", "memory", "hyperscaler"],
+            include_cross=True,
+            noise_model=args.noise_model,
+            data_source=args.data_source,
+        )
+        print("\n🎯 Path harvest complete. Next: python paper_trading_ml_exit.py --train-only")
     else:
         thr = args.ml_threshold
         if thr is None:
             thr = config_exit_threshold()
-        # Harvest: disable soft MR so labels aren't all "good exit" winners
-        harvest_force_rules = not args.harvest_training
         trader, exit_mgr, data = run_paper_trading_and_train(
             n_bars=args.n_bars,
             min_trades=args.min_trades,
@@ -2240,7 +2286,7 @@ if __name__ == "__main__":
             data_window=args.data_window,
             journal_scope=args.save_journal,
             replace_training=args.replace_training,
-            force_rules=harvest_force_rules,
+            force_rules=True,
         )
 
         if args.mode == "research":

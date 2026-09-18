@@ -321,18 +321,30 @@ class TestTradeLabels(unittest.TestCase):
 class TestHalfLife(unittest.TestCase):
     def test_mean_reverting_series_has_finite_half_life(self):
         rng = np.random.default_rng(0)
-        n = 120
+        n = 200
         x = np.zeros(n)
         for i in range(1, n):
-            x[i] = 0.7 * x[i - 1] + rng.normal(0, 0.3)
-        hl = m.estimate_half_life(pd.Series(x), lookback=40)
-        self.assertGreaterEqual(hl, 2.0)
-        self.assertLessEqual(hl, 60.0)
+            x[i] = 0.9 * x[i - 1] + rng.normal(0, 0.3)
+        hl = m.estimate_half_life(pd.Series(x), lookback=80)
+        # AR(1) φ=0.9 → true hl ≈ 6.6; allow estimator noise
+        self.assertGreaterEqual(hl, 4.0)
+        self.assertLessEqual(hl, 20.0)
 
     def test_trending_series_returns_long_half_life(self):
-        x = pd.Series(np.linspace(0, 10, 80) + np.random.default_rng(1).normal(0, 0.01, 80))
-        hl = m.estimate_half_life(x, lookback=40)
+        x = pd.Series(np.linspace(0, 10, 120) + np.random.default_rng(1).normal(0, 0.01, 120))
+        hl = m.estimate_half_life(x, lookback=80)
         self.assertGreaterEqual(hl, 30.0)
+
+    def test_known_phi_recovers_roughly(self):
+        from src.half_life import estimate_half_life
+        rng = np.random.default_rng(2)
+        phi, n = 0.95, 400
+        x = np.zeros(n)
+        for i in range(1, n):
+            x[i] = phi * x[i - 1] + rng.normal(0, 1.0)
+        true = -np.log(2) / np.log(phi)
+        hl = estimate_half_life(pd.Series(x), lookback=200)
+        self.assertLess(abs(hl - true) / true, 0.45)
 
 
 class TestOHLCVLoader(unittest.TestCase):
