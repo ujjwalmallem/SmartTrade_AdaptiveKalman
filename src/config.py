@@ -71,3 +71,29 @@ def exit_threshold(cfg: Optional[Dict[str, Any]] = None) -> float:
 def training_min_samples(cfg: Optional[Dict[str, Any]] = None) -> int:
     cfg = cfg or load_strategy_config()
     return int((cfg.get("training") or {}).get("min_samples", 50))
+
+
+def entry_z_threshold(cfg: Optional[Dict[str, Any]] = None) -> float:
+    cfg = cfg or load_strategy_config()
+    return float((cfg.get("entry") or {}).get("z_entry", 2.0))
+
+
+def entry_min_confidence(cfg: Optional[Dict[str, Any]] = None) -> float:
+    cfg = cfg or load_strategy_config()
+    return float((cfg.get("entry") or {}).get("min_confidence", 0.55))
+
+
+def execution_risk_frac(cfg: Optional[Dict[str, Any]] = None) -> float:
+    cfg = cfg or load_strategy_config()
+    return float((cfg.get("execution") or {}).get("risk_frac", 0.08))
+
+
+def kalman_settings(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """delta / R_base / noise_model from YAML (merged with defaults)."""
+    cfg = cfg or load_strategy_config()
+    k = cfg.get("kalman") or {}
+    return {
+        "delta": float(k.get("delta", 1e-4)),
+        "R_base": float(k.get("R_base", 1e-2)),
+        "noise_model": str(k.get("noise_model", "standard")),
+    }

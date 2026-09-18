@@ -32,7 +32,14 @@ from src.features import (
 )
 from src.exit_manager import StatArbExitManager, TradeState, time_stop_bars
 from src.train_exit_model import train_exit_model as train_sklearn_exit_model
-from src.config import load_strategy_config, exit_threshold as config_exit_threshold
+from src.config import (
+    load_strategy_config,
+    exit_threshold as config_exit_threshold,
+    entry_z_threshold,
+    entry_min_confidence,
+    execution_risk_frac,
+    kalman_settings,
+)
 from src.kalman import AdaptiveKalmanPairs, KalmanNoiseModel
 from src.journal import (
     dedupe_journal_rows,
@@ -55,6 +62,47 @@ FEATURE_SCHEMA_VERSION = int(SPEC_FEATURE_SCHEMA_VERSION)
 
 # AdaptiveKalmanPairs → src/kalman.py; journal helpers → src/journal.py
 # LogisticExitModel → src/legacy_logistic.py (quarantined; not used for exits)
+
+
+def build_kalman(
+    noise_model: Optional[KalmanNoiseModel | str] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> AdaptiveKalmanPairs:
+    """Construct AdaptiveKalmanPairs from strategy YAML (optional noise override)."""
+    settings = kalman_settings(cfg)
+    nm = noise_model if noise_model is not None else settings["noise_model"]
+    if isinstance(nm, str):
+        nm = KalmanNoiseModel(nm)
+    return AdaptiveKalmanPairs(
+        delta=settings["delta"],
+        R_base=settings["R_base"],
+        noise_model=nm,
+    )
+
+
+def entry_direction(
+    z: float,
+    conf: float,
+    *,
+    z_entry: Optional[float] = None,
+    min_confidence: Optional[float] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> int:
+    """
+    Return +1 (long spread), -1 (short spread), or 0 (no entry)
+    using config entry.z_entry / entry.min_confidence.
+    """
+    z_thr = float(z_entry if z_entry is not None else entry_z_threshold(cfg))
+    conf_thr = float(
+        min_confidence if min_confidence is not None else entry_min_confidence(cfg)
+    )
+    if conf <= conf_thr:
+        return 0
+    if z < -z_thr:
+        return 1
+    if z > z_thr:
+        return -1
+    return 0
 
 # ============================================================
 # TICKER UNIVERSES — Mag7 / Semis / Memory / Hyperscaler
@@ -649,6 +697,8 @@ def _simulate_setups_for_pair(
     z_to_pct: float = 0.01,
     trade_year: Optional[int] = None,
     exit_manager: Optional[StatArbExitManager] = None,
+    z_entry: Optional[float] = None,
+    min_confidence: Optional[float] = None,
 ) -> List[Setup]:
     """
     Research mode: walk the window and simulate every valid z-crossing to
@@ -659,6 +709,11 @@ def _simulate_setups_for_pair(
     """
     if exit_manager is None:
         raise ValueError("exit_manager is required for research setups")
+    cfg = load_strategy_config()
+    z_thr = float(z_entry if z_entry is not None else entry_z_threshold(cfg))
+    conf_thr = float(
+        min_confidence if min_confidence is not None else entry_min_confidence(cfg)
+    )
     setups: List[Setup] = []
     position = 0
     entry_idx = 0
@@ -681,11 +736,10 @@ def _simulate_setups_for_pair(
         if position == 0:
             if latest_only and int(pd.Timestamp(time).year) != year:
                 continue
-            if z < -2.0 and conf > 0.55:
-                direction = 1
-            elif z > 2.0 and conf > 0.55:
-                direction = -1
-            else:
+            direction = entry_direction(
+                z, conf, z_entry=z_thr, min_confidence=conf_thr
+            )
+            if direction == 0:
                 continue
 
             position = direction
@@ -844,7 +898,7 @@ def run_research_setups(
     exit_manager = load_exit_manager(ml_threshold=ml_threshold)
 
     run_id = pd.Timestamp.now("UTC").strftime("%Y%m%dT%H%M%SZ")
-    kf = AdaptiveKalmanPairs(delta=1e-4, R_base=1e-2, noise_model=noise_model)
+    kf = build_kalman(noise_model=noise_model)
     all_setups: List[Setup] = []
 
     for pair in pairs:
@@ -1557,6 +1611,10 @@ def _trade_pair_session(
     """
     if exit_manager is None:
         raise ValueError("exit_manager is required for live/backtest exits")
+    cfg = load_strategy_config()
+    z_thr = entry_z_threshold(cfg)
+    conf_thr = entry_min_confidence(cfg)
+    risk_frac = execution_risk_frac(cfg)
     position = 0
     entry_idx = 0
     opened = 0
@@ -1637,12 +1695,17 @@ def _trade_pair_session(
                         f"(qty {exp['qty_a']:.0f}/{exp['qty_b']:.0f}) — will not re-enter"
                     )
 
-            # Classic z-score entry with confidence filter (only if still flat)
-            if position == 0 and z < -2.0 and conf > 0.55:
-                position = 1
+            # Config-driven z-score entry with confidence filter (only if still flat)
+            direction = (
+                entry_direction(z, conf, z_entry=z_thr, min_confidence=conf_thr)
+                if position == 0
+                else 0
+            )
+            if direction != 0:
+                position = direction
                 entry_idx = i
                 pos_state = PositionState(
-                    direction=1,
+                    direction=direction,
                     entry_z=z,
                     entry_bar=i,
                     entry_spread=float(row["spread"]),
@@ -1650,47 +1713,19 @@ def _trade_pair_session(
                 )
                 before_n = len(trader.trades)
                 trader.open_trade(
-                    direction=1,
+                    direction=direction,
                     time=time,
                     z=z,
                     spread=row["spread"],
                     ticker_a=pair.ticker_a,
                     ticker_b=pair.ticker_b,
                     basket=pair.basket,
-                    risk_frac=0.08,
+                    risk_frac=risk_frac,
                     price_a=float(row["price_a"]),
                     price_b=float(row["price_b"]),
                 )
                 if len(trader.trades) == before_n:
                     position = 0  # broker refused (e.g. existing exposure)
-                else:
-                    fresh_entry_this_bar = True
-
-            elif position == 0 and z > 2.0 and conf > 0.55:
-                position = -1
-                entry_idx = i
-                pos_state = PositionState(
-                    direction=-1,
-                    entry_z=z,
-                    entry_bar=i,
-                    entry_spread=float(row["spread"]),
-                    highest_favorable_z=0.0,
-                )
-                before_n = len(trader.trades)
-                trader.open_trade(
-                    direction=-1,
-                    time=time,
-                    z=z,
-                    spread=row["spread"],
-                    ticker_a=pair.ticker_a,
-                    ticker_b=pair.ticker_b,
-                    basket=pair.basket,
-                    risk_frac=0.08,
-                    price_a=float(row["price_a"]),
-                    price_b=float(row["price_b"]),
-                )
-                if len(trader.trades) == before_n:
-                    position = 0
                 else:
                     fresh_entry_this_bar = True
 
@@ -1907,7 +1942,7 @@ def run_paper_trading_and_train(
         execute_latest_only=alpaca_latest_only,
         latest_bar=latest_bar,
     )
-    kf = AdaptiveKalmanPairs(delta=1e-4, R_base=1e-2, noise_model=noise_model)
+    kf = build_kalman(noise_model=noise_model)
     pair_frames: Dict[str, pd.DataFrame] = {}
     closed_count = 0
 

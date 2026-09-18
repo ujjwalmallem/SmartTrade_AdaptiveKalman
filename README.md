@@ -18,7 +18,7 @@ python paper_trading_ml_exit.py --train-only
 PYTHONPATH=. python -m src.train_exit_model --results-dir results
 ```
 
-**Exit stack (see `SYSTEM_SPEC.md`):** Kalman state → `StatArbExitManager` (hard time-stop / stop-loss / ML ≥ 0.68 from `config/strategy_config.yaml`). Sklearn artifacts under `models/*.pkl`. Live/backtest/research **require** the manager (fail-closed). Soft MR only when sklearn weights are missing. Legacy JSON logistic lives in `src/legacy_logistic.py` for old artifacts/tests only. Training requires ≥50 labeled rows by default.
+**Exit stack (see `SYSTEM_SPEC.md`):** Kalman state → `StatArbExitManager` (hard time-stop / stop-loss / ML ≥ 0.68 from `config/strategy_config.yaml`). Entry z/confidence and Kalman knobs also come from YAML. Sklearn artifacts under `models/*.pkl`. Live/backtest/research **require** the manager (fail-closed). Soft MR only when sklearn weights are missing. Legacy JSON logistic lives in `src/legacy_logistic.py` for old artifacts/tests only. Training requires ≥50 labeled rows by default.
 
 **Modes:**
 - `live` — latest-bar Alpaca paper orders only (preferred path for real paper fills)

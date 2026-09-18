@@ -211,5 +211,7 @@ Prompt Cursor with:
 | NaN-safe ML path | Done — `evaluate_trade` holds on non-finite features |
 | Lookahead labeling $H = 2.5×hl$ | Done in `src/train_exit_model.label_path_bars` |
 | Legacy `LogisticExitModel` | Quarantined in `src/legacy_logistic.py` (tests / old JSON only) |
+| Config-driven entry (`z_entry` / `min_confidence`) + Kalman knobs | Done — `entry_direction` / `build_kalman` read YAML |
+| Soft MR bands from `risk_engine.soft_mr_*` | Done — on manager; used when weights missing |
 | Further monolith split (`PositionState`, broker loop) | Deferred |
 

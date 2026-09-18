@@ -22,6 +22,34 @@ class TestConfigSSOT(unittest.TestCase):
         self.assertGreaterEqual(training_min_samples(cfg), 50)
         self.assertEqual(cfg["exit_model"]["backend"], "sklearn")
 
+    def test_entry_and_kalman_from_yaml(self):
+        from src.config import (
+            entry_z_threshold,
+            entry_min_confidence,
+            execution_risk_frac,
+            kalman_settings,
+        )
+        cfg = load_strategy_config()
+        self.assertAlmostEqual(entry_z_threshold(cfg), 2.0)
+        self.assertAlmostEqual(entry_min_confidence(cfg), 0.55)
+        self.assertAlmostEqual(execution_risk_frac(cfg), 0.08)
+        k = kalman_settings(cfg)
+        self.assertAlmostEqual(k["delta"], 1e-4)
+        self.assertAlmostEqual(k["R_base"], 1e-2)
+
+    def test_cli_imports_src_kalman(self):
+        from src import kalman as kmod
+        self.assertIs(m.AdaptiveKalmanPairs, kmod.AdaptiveKalmanPairs)
+        self.assertIs(m.KalmanNoiseModel, kmod.KalmanNoiseModel)
+        kf = m.build_kalman()
+        self.assertIsInstance(kf, kmod.AdaptiveKalmanPairs)
+
+    def test_entry_direction_respects_thresholds(self):
+        self.assertEqual(m.entry_direction(-2.1, 0.6, z_entry=2.0, min_confidence=0.55), 1)
+        self.assertEqual(m.entry_direction(2.1, 0.6, z_entry=2.0, min_confidence=0.55), -1)
+        self.assertEqual(m.entry_direction(-2.1, 0.4, z_entry=2.0, min_confidence=0.55), 0)
+        self.assertEqual(m.entry_direction(-1.5, 0.9, z_entry=2.0, min_confidence=0.55), 0)
+
 
 class TestHalfLifeFields(unittest.TestCase):
     def test_trade_state_keeps_raw_and_normalized_distinct(self):
