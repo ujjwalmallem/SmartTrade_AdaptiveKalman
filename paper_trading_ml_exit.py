@@ -33,6 +33,7 @@ from src.features import (
 )
 from src.exit_manager import StatArbExitManager, TradeState, time_stop_bars
 from src.train_exit_model import train_exit_model as train_sklearn_exit_model
+from src.config import load_strategy_config, exit_threshold as config_exit_threshold
 
 # Default artifact locations (gitignored locally; CI uploads as artifacts)
 RESULTS_DIR = Path("results")
@@ -675,7 +676,12 @@ class AdaptiveKalmanPairs:
 
 
 class LogisticExitModel:
-    """L2 logistic regression for exit decisions (z-scored features)."""
+    """
+    DEPRECATED — legacy in-process logistic (results/logistic_exit_model.json).
+
+    Production exits use StatArbExitManager + models/*.pkl (SYSTEM_SPEC).
+    Kept for reading old artifacts and unit tests only.
+    """
 
     def __init__(self):
         self.weights = None
@@ -1075,7 +1081,7 @@ def run_research_setups(
     baskets: Optional[Sequence[str]] = None,
     include_cross: bool = True,
     max_pairs_per_basket: int = 6,
-    ml_threshold: float = 0.68,
+    ml_threshold: Optional[float] = None,
     noise_model: KalmanNoiseModel | str = KalmanNoiseModel.STANDARD,
     data_source: str = "auto",
     data_window: str = "multi_year",
@@ -1087,6 +1093,8 @@ def run_research_setups(
     data_window = (data_window or "multi_year").lower().strip()
     if data_window not in ("multi_year", "latest_year"):
         raise ValueError("data_window must be 'multi_year' or 'latest_year'")
+    if ml_threshold is None:
+        ml_threshold = config_exit_threshold()
 
     print("Starting Research Setup Pass...")
     print(f"Mode: research (data_window={data_window})")
@@ -1122,23 +1130,9 @@ def run_research_setups(
     else:
         print("Research entries: all bars in loaded panel (no year gate)\n")
 
+    # Production exit path is StatArbExitManager only (legacy JSON deprecated)
     model = None
-    if MODEL_JSON.exists():
-        try:
-            model = LogisticExitModel.load(MODEL_JSON)
-            if (
-                model.weights is None
-                or len(model.weights) != len(FEATURE_NAMES)
-                or list(getattr(model, "feature_names", [])) != list(FEATURE_NAMES)
-            ):
-                model = None
-            else:
-                print(f"✅ Loaded exit model from {MODEL_JSON}")
-        except Exception as exc:
-            print(f"⚠️ Could not load model ({exc}); rules-only research")
-            model = None
-    else:
-        print("ℹ️  No saved exit model — rules-only research exits")
+    print("ℹ️  Research exits via StatArbExitManager (sklearn artifacts if present)")
 
     exit_manager = load_exit_manager(ml_threshold=ml_threshold)
 
@@ -1520,35 +1514,34 @@ def train_from_stored_results(
     dataset_path: Optional[Path] = None,
     model_path: Optional[Path] = None,
     reg: float = 0.3,
-    min_samples: int = 2,
-) -> LogisticExitModel:
-    """Fit the exit model on stored live (Alpaca/yfinance) paper trades only."""
-    # Prefer SYSTEM_SPEC sklearn pipeline when enough rows exist
+    min_samples: Optional[int] = None,
+) -> Optional[LogisticExitModel]:
+    """
+    Train the production sklearn exit model (SYSTEM_SPEC).
+
+    Returns None on success of the sklearn path (artifacts under models/).
+    Legacy JSON LogisticExitModel is no longer written for live use.
+    """
+    results_dir = Path(dataset_path).parent if dataset_path else RESULTS_DIR
+    cfg = load_strategy_config()
+    floor = min_samples if min_samples is not None else int(
+        (cfg.get("training") or {}).get("min_samples", 50)
+    )
     try:
-        train_sklearn_exit_model(
-            Path(dataset_path).parent if dataset_path else RESULTS_DIR,
-            min_samples=max(4, min_samples),
+        meta = train_sklearn_exit_model(
+            results_dir,
+            min_samples=floor,
             calibrate=True,
         )
+        print(
+            f"✅ Sklearn exit model promoted "
+            f"(n={meta['metrics']['n_samples']}, "
+            f"pos_rate={meta['metrics']['class_balance']['positive_rate']:.1%})"
+        )
+        return None
     except Exception as exc:
-        print(f"ℹ️  Sklearn exit trainer skipped ({exc}); using in-process logistic")
-
-    dataset_path = Path(dataset_path) if dataset_path is not None else DATASET_CSV
-    model_path = Path(model_path) if model_path is not None else MODEL_JSON
-    X, y, ds = load_training_dataset(dataset_path, require_live=True)
-    if len(y) < min_samples:
-        raise ValueError(f"Need at least {min_samples} samples; found {len(y)} in {dataset_path}")
-
-    print(f"\nTraining from stored results: {len(y)} live samples ({dataset_path})")
-    if "data_source" in ds.columns:
-        print(f"  Sources: {sorted(ds['data_source'].dropna().astype(str).unique().tolist())}")
-    print(f"  Baskets: {sorted(ds['basket'].dropna().unique().tolist()) if 'basket' in ds else 'n/a'}")
-    model = LogisticExitModel()
-    model.fit(X, y, reg=reg)
-    out = model.save(model_path)
-    print(f"✅ Model trained and saved → {out}")
-    analyze_feature_importance(model, FEATURE_NAMES)
-    return model
+        print(f"⚠️  Sklearn exit trainer skipped ({exc})")
+        raise
 
 # ============================================================
 # PAPER TRADING ENGINE
@@ -1853,12 +1846,16 @@ def build_trade_state(
 
 
 def load_exit_manager(
-    ml_threshold: float = 0.68,
+    ml_threshold: Optional[float] = None,
     config_path: Path | str = "config/strategy_config.yaml",
 ) -> StatArbExitManager:
     """Load StatArbExitManager from YAML + optional sklearn artifacts."""
+    cfg = load_strategy_config(config_path)
+    threshold = float(
+        ml_threshold if ml_threshold is not None else config_exit_threshold(cfg)
+    )
     mgr = StatArbExitManager.from_config(config_path)
-    mgr.exit_threshold = float(ml_threshold)
+    mgr.exit_threshold = threshold
     if mgr.model is not None and mgr.scaler is not None:
         print(
             f"✅ StatArbExitManager ready "
@@ -1868,7 +1865,8 @@ def load_exit_manager(
     else:
         print(
             "ℹ️  StatArbExitManager active without sklearn weights — "
-            "hard time-stop / stop-loss only until models/*.pkl exist"
+            "hard time-stop / stop-loss only until models/*.pkl exist "
+            f"(need ≥{(cfg.get('training') or {}).get('min_samples', 50)} labeled rows)"
         )
     return mgr
 
@@ -2217,7 +2215,7 @@ def run_paper_trading_and_train(
     baskets: Optional[Sequence[str]] = None,
     include_cross: bool = True,
     max_pairs_per_basket: int = 6,
-    ml_threshold: float = 0.68,
+    ml_threshold: Optional[float] = None,
     noise_model: KalmanNoiseModel | str = KalmanNoiseModel.STANDARD,
     broker: str = "sim",
     alpaca_latest_only: bool = True,
@@ -2230,6 +2228,9 @@ def run_paper_trading_and_train(
     mode = (mode or "backtest").lower().strip()
     if mode not in ("backtest", "live", "research"):
         raise ValueError("mode must be 'backtest', 'live', or 'research'")
+
+    if ml_threshold is None:
+        ml_threshold = config_exit_threshold()
 
     if mode == "research":
         setups, path = run_research_setups(
@@ -2282,31 +2283,9 @@ def run_paper_trading_and_train(
     print(f"Kalman R mode: {noise_model.value}")
     print(f"Trade windows: {trade_year} only (no prior-year entries)\n")
 
-    # Try to load a previously trained model (rule-only if missing)
+    # Production exit path: StatArbExitManager only (SYSTEM_SPEC).
+    # Legacy results/logistic_exit_model.json is no longer loaded for live exits.
     model = None
-    if MODEL_JSON.exists():
-        try:
-            model = LogisticExitModel.load(MODEL_JSON)
-            if (
-                model.weights is None
-                or len(model.weights) != len(FEATURE_NAMES)
-                or list(getattr(model, "feature_names", [])) != list(FEATURE_NAMES)
-            ):
-                print(
-                    f"⚠️ Saved model feature schema mismatch "
-                    f"({None if model.weights is None else len(model.weights)} vs "
-                    f"{len(FEATURE_NAMES)} / names differ); running rule-only this session"
-                )
-                model = None
-            else:
-                print(f"✅ Loaded existing exit model from {MODEL_JSON}")
-        except Exception as e:
-            print(f"⚠️ Could not load model ({e}); running rule-only this session")
-            model = None
-    else:
-        print("ℹ️  No saved exit model yet — rule-only exits this session")
-
-    # SYSTEM_SPEC exit governor (time-stop / stop-loss / ML threshold)
     exit_manager = load_exit_manager(ml_threshold=ml_threshold)
 
     # 2–3. Adaptive Kalman filter + paper trader (optional Alpaca paper brokerage)
@@ -2395,23 +2374,24 @@ def run_paper_trading_and_train(
             )
             if to_save:
                 save_paper_results(to_save, data_source=data_source, journal_scope=scope)
-            return trader, None, df_out
+            return trader, exit_manager, df_out
         print("Not enough trades generated. Try increasing n_bars or relaxing entry thresholds.")
         # Still persist when explicitly journaling (e.g. alpaca scope with open rows)
         if to_save and scope not in ("none", "off", "skip"):
             save_paper_results(to_save, data_source=data_source, journal_scope=scope)
-        return trader, None, df_out
+        return trader, exit_manager, df_out
 
-    # 5. Persist results, then train (from this run + any prior stored history)
+    # 5. Persist results, then train sklearn exit model when enough labels exist
     save_paper_results(to_save, data_source=data_source, journal_scope=scope)
     print("\nTraining ML Exit Model on stored paper trades...")
     try:
-        model = train_from_stored_results()
+        train_from_stored_results()
+        # Reload manager so subsequent callers see fresh weights
+        exit_manager = load_exit_manager(ml_threshold=ml_threshold)
     except ValueError as e:
         print(f"⚠️ Skipping train this run: {e}")
-        model = None
 
-    return trader, model, df_out
+    return trader, exit_manager, df_out
 
 
 # ============================================================
@@ -2431,8 +2411,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ml-threshold",
         type=float,
-        default=0.68,
-        help="ML exit probability threshold for forced exits (default 0.68)",
+        default=None,
+        help=(
+            "ML exit probability threshold "
+            "(default: config/strategy_config.yaml exit_model.probability_threshold)"
+        ),
     )
     parser.add_argument(
         "--noise-model",
@@ -2499,17 +2482,20 @@ if __name__ == "__main__":
 
     if args.train_only:
         try:
-            model = train_from_stored_results()
-            print("\n🎯 Retrain complete from stored results.")
+            train_from_stored_results()
+            print("\n🎯 Retrain complete → models/logistic_exit_model.pkl")
         except ValueError as e:
             print(f"\n⚠️ Retrain skipped: {e}")
     else:
-        trader, model, data = run_paper_trading_and_train(
+        thr = args.ml_threshold
+        if thr is None:
+            thr = config_exit_threshold()
+        trader, exit_mgr, data = run_paper_trading_and_train(
             n_bars=args.n_bars,
             min_trades=args.min_trades,
             baskets=["mag7", "semis", "memory", "hyperscaler"],
             include_cross=True,
-            ml_threshold=args.ml_threshold,
+            ml_threshold=thr,
             noise_model=args.noise_model,
             broker=args.broker,
             alpaca_latest_only=not args.alpaca_all_bars,
@@ -2524,12 +2510,15 @@ if __name__ == "__main__":
             print("\n🎯 Research setup pass complete.")
             print(f"   Setups: {data}")
             print("Live/backtest journal untouched.")
-        elif model is None:
-            print("\n⚠️ Paper trading finished without enough trades to train.")
         else:
             print("\n🎯 Paper trading session complete.")
             print(f"   Journal:  {TRADES_CSV}")
             print(f"   Dataset:  {DATASET_CSV}")
-            print(f"   Model:    {MODEL_JSON}")
+            pkl = Path("models/logistic_exit_model.pkl")
+            if exit_mgr is not None and exit_mgr.model is not None:
+                print(f"   Exit mgr: StatArbExitManager @ {exit_mgr.exit_threshold}")
+                print(f"   Model:    {pkl}")
+            else:
+                print("   Exit mgr: hard stops only (sklearn model not promoted yet)")
             print("Universe covered: Mag7, semis, memory, hyperscaler.")
-            print("Next: python paper_trading_ml_exit.py --train-only")
+            print("Next: PYTHONPATH=. python -m src.train_exit_model")

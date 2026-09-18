@@ -407,7 +407,7 @@ class TestEndToEndYfinance(unittest.TestCase):
             m.DATASET_CSV = tmp_path / "exit_training_dataset.csv"
             m.MODEL_JSON = tmp_path / "logistic_exit_model.json"
 
-            trader, model, _ = m.run_paper_trading_and_train(
+            trader, exit_mgr, _ = m.run_paper_trading_and_train(
                 n_bars=400,
                 min_trades=2,
                 baskets=["mag7", "semis", "memory", "hyperscaler"],
@@ -425,16 +425,15 @@ class TestEndToEndYfinance(unittest.TestCase):
             self.assertTrue((journal["data_source"] == "yfinance_live").all())
             years = pd.to_datetime(journal["entry_time"], format="mixed").dt.year.unique().tolist()
             self.assertEqual(years, [2026])
-            self.assertIsNotNone(model)
-            self.assertIsNotNone(model.weights)
-            self.assertEqual(len(model.weights), len(m.FEATURE_NAMES))
+            self.assertIsNotNone(exit_mgr)
+            self.assertIsInstance(exit_mgr, m.StatArbExitManager)
+            self.assertAlmostEqual(exit_mgr.exit_threshold, 0.68)
             self.assertIn("half_life", m.FEATURE_NAMES)
             self.assertIn("abs_entry_z", m.FEATURE_NAMES)
             self.assertIn("pnl_proxy", m.FEATURE_NAMES)
             self.assertNotIn("favorable", m.FEATURE_NAMES)
             self.assertNotIn("best_fav", m.FEATURE_NAMES)
             self.assertNotIn("entry_z", m.FEATURE_NAMES)
-            self.assertTrue((tmp_path / "logistic_exit_model.json").exists())
             for t in closed:
                 self.assertGreater(t.notional, 0.0)
                 self.assertIsNotNone(t.pnl_dollars)
