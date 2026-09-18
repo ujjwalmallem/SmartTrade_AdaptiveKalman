@@ -102,6 +102,8 @@ class StatArbExitManager:
         self.hard_pnl_stop_dollars = float(
             risk_cfg.get("hard_pnl_stop_dollars", hard_pnl_stop_dollars)
         )
+        self.soft_mr_long_z = float(risk_cfg.get("soft_mr_long_z", -0.35))
+        self.soft_mr_short_z = float(risk_cfg.get("soft_mr_short_z", 0.35))
         self.feature_names = list(FEATURE_NAMES)
 
         model_path = model_path or exit_cfg.get("model_path", "models/logistic_exit_model.pkl")

@@ -12,7 +12,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field, asdict
-from enum import Enum
 from types import SimpleNamespace
 from typing import List, Dict, Iterable, Optional, Sequence, Tuple, Any
 import os
@@ -34,6 +33,14 @@ from src.features import (
 from src.exit_manager import StatArbExitManager, TradeState, time_stop_bars
 from src.train_exit_model import train_exit_model as train_sklearn_exit_model
 from src.config import load_strategy_config, exit_threshold as config_exit_threshold
+from src.kalman import AdaptiveKalmanPairs, KalmanNoiseModel
+from src.journal import (
+    dedupe_journal_rows,
+    filter_journal_by_scope,
+    is_wash_closed_row as _is_wash_closed_row,
+    trade_fingerprint_cols as _trade_fingerprint_cols,
+)
+from src.legacy_logistic import LogisticExitModel
 
 # Default artifact locations (gitignored locally; CI uploads as artifacts)
 RESULTS_DIR = Path("results")
@@ -46,14 +53,8 @@ SETUPS_GLOB = "setups_*.csv"
 FEATURE_NAMES = list(SPEC_FEATURE_NAMES)
 FEATURE_SCHEMA_VERSION = int(SPEC_FEATURE_SCHEMA_VERSION)
 
-# ============================================================
-# PASTE ALL PREVIOUS CLASSES HERE (or keep them in the same file)
-# AdaptiveKalmanPairs + extract_exit_features + LogisticExitModel included below.
-# PositionState, generate_training_data helpers, ExitConfig, etc. can be extended here.
-# ============================================================
-
-# For this standalone version I include minimal working versions
-# so you can run it immediately.
+# AdaptiveKalmanPairs → src/kalman.py; journal helpers → src/journal.py
+# LogisticExitModel → src/legacy_logistic.py (quarantined; not used for exits)
 
 # ============================================================
 # TICKER UNIVERSES — Mag7 / Semis / Memory / Hyperscaler
@@ -447,310 +448,14 @@ def _load_prices_for_universe(
 
 
 # ============================================================
-# ADAPTIVE KALMAN PAIRS  –  with Zeiierman-style adaptive R
+# ADAPTIVE KALMAN PAIRS  –  imported from src.kalman
 # ============================================================
-
-class KalmanNoiseModel(str, Enum):
-    STANDARD = "standard"
-    VOLUME = "volume"        # needs volume series
-    PARKINSON = "parkinson"  # needs high & low series
-
-
-@dataclass
-class AdaptiveKalmanPairs:
-    """
-    Online Kalman filter for pairs: state = [α, β]
-    Observation: price_a = α + β * price_b + v
-
-    Adaptive features
-    -----------------
-    • Process noise Q is scaled by recent innovation magnitude
-    • Measurement noise R can be:
-        - STANDARD   : fixed (price-scale calibrated)
-        - VOLUME     : shrinks when volume is high (more trust)
-        - PARKINSON  : grows with high-low range (volatility)
-    """
-    delta: float = 1e-4                 # base process-noise scale
-    R_base: float = 1e-2                # base measurement noise
-    adapt_window: int = 20
-    min_conf: float = 0.25
-    max_conf: float = 0.95
-    noise_model: KalmanNoiseModel = KalmanNoiseModel.STANDARD
-
-    # Optional scaling factors for the adaptive modes
-    volume_power: float = 0.6
-    parkinson_power: float = 1.0
-    r_floor: float = 1e-4
-    r_ceil: float = 5.0
-
-    # Back-compat alias used by older call sites (R=...)
-    R: Optional[float] = None
-
-    def __post_init__(self):
-        if self.R is not None:
-            self.R_base = float(self.R)
-        if isinstance(self.noise_model, str):
-            self.noise_model = KalmanNoiseModel(self.noise_model)
-        self.reset()
-
-    def reset(self):
-        self.x = np.zeros(2)                     # [α, β]
-        self.P = np.eye(2) * 1.0
-        self.Q_base = self.delta * np.eye(2)
-        self.innovations: List[float] = []
-        self._ewma_var = 1e-4
-        self.history: List[dict] = []
-
-    def _adapt_Q(self) -> np.ndarray:
-        if len(self.innovations) < 5:
-            return self.Q_base.copy()
-        recent = np.array(self.innovations[-self.adapt_window:])
-        scale = np.clip(np.std(recent) / (np.mean(np.abs(recent)) + 1e-8), 0.3, 5.0)
-        return self.Q_base * scale
-
-    def _adapt_R(
-        self,
-        volume: Optional[float] = None,
-        high: Optional[float] = None,
-        low: Optional[float] = None,
-        price: Optional[float] = None,
-    ) -> float:
-        if self.noise_model == KalmanNoiseModel.STANDARD:
-            return float(self.R_base)
-
-        if self.noise_model == KalmanNoiseModel.VOLUME:
-            if volume is None or volume <= 0:
-                return float(self.R_base)
-            # `volume` is expected as relative volume (≈1.0 = typical).
-            # Higher relative volume → lower R (more trust in the print).
-            vol_factor = 1.0 / (1.0 + (float(volume) ** self.volume_power))
-            R = self.R_base * (0.35 + 1.3 * vol_factor)
-            return float(np.clip(R, self.r_floor, self.r_ceil))
-
-        if self.noise_model == KalmanNoiseModel.PARKINSON:
-            if high is None or low is None or high <= low:
-                return float(self.R_base)
-            range_proxy = max(np.log(high / low), 1e-6) ** 2
-            R = self.R_base * (1.0 + self.parkinson_power * range_proxy * 100)
-            return float(np.clip(R, self.r_floor, self.r_ceil))
-
-        return float(self.R_base)
-
-    def update(
-        self,
-        price_a: float,
-        price_b: float,
-        volume: Optional[float] = None,
-        high: Optional[float] = None,
-        low: Optional[float] = None,
-    ) -> dict:
-        H = np.array([1.0, price_b])
-
-        x_prior = self.x.copy()
-        Q = self._adapt_Q()
-        P_prior = self.P + Q
-
-        R = self._adapt_R(volume=volume, high=high, low=low, price=price_a)
-
-        y_pred = H @ x_prior
-        innov = price_a - y_pred
-        S = float(H @ P_prior @ H.T + R)
-        K = (P_prior @ H.T) / S
-
-        self.x = x_prior + K * innov
-        self.P = (np.eye(2) - np.outer(K, H)) @ P_prior
-
-        self.innovations.append(float(innov))
-        if len(self.innovations) > 200:
-            self.innovations = self.innovations[-200:]
-
-        self._ewma_var = 0.94 * self._ewma_var + 0.06 * innov**2
-        spread_std = float(np.sqrt(self._ewma_var + 1e-8))
-        z = innov / spread_std
-
-        conf = 1.0 / (1.0 + np.sqrt(S / max(R, 1e-8)))
-        conf = float(np.clip(conf, self.min_conf, self.max_conf))
-
-        out = {
-            "alpha": float(self.x[0]),
-            "beta": float(self.x[1]),
-            "spread": float(innov),
-            "spread_std": float(spread_std),
-            "zscore": float(z),
-            "confidence": conf,
-            "innovation": float(innov),
-            "R": float(R),
-            "kalman_gain_beta": float(K[1]),
-        }
-        self.history.append(out)
-        return out
-
-    def filter_pair(
-        self,
-        a: pd.Series,
-        b: pd.Series,
-        volume: Optional[pd.Series] = None,
-        high: Optional[pd.Series] = None,
-        low: Optional[pd.Series] = None,
-    ) -> pd.DataFrame:
-        """
-        Run the filter over two aligned price series.
-        Optional volume / high / low enable the adaptive R modes.
-        """
-        self.reset()
-        a = a.astype(float).dropna()
-        b = b.astype(float).dropna()
-        common = a.index.intersection(b.index)
-
-        if volume is not None:
-            volume = volume.reindex(common).fillna(0)
-            # Relative volume vs rolling median → stable VOLUME-mode R scaling
-            vol_med = volume.replace(0, np.nan).rolling(20, min_periods=5).median()
-            vol_med = vol_med.fillna(volume.replace(0, np.nan).median()).fillna(1.0)
-            volume = (volume / vol_med.replace(0, np.nan)).fillna(1.0).clip(0.05, 20.0)
-        if high is not None:
-            high = high.reindex(common)
-        if low is not None:
-            low = low.reindex(common)
-
-        a, b = a.loc[common], b.loc[common]
-
-        # Calibrate base noise to absolute price scale
-        price_scale = float(max(np.nanmedian(np.abs(a.values)), 1.0))
-        self.R_base = max((price_scale ** 2) * 1e-4, self.r_floor)
-        self.Q_base = (self.delta * (price_scale ** 2)) * np.eye(2)
-        # For adaptive modes, raise ceiling with price scale
-        self.r_ceil = max(self.r_ceil, self.R_base * 50)
-
-        rows = []
-        prev_spread = 0.0
-
-        for i, ts in enumerate(common):
-            vol = float(volume.iloc[i]) if volume is not None else None
-            hi = float(high.iloc[i]) if high is not None and pd.notna(high.iloc[i]) else None
-            lo = float(low.iloc[i]) if low is not None and pd.notna(low.iloc[i]) else None
-
-            st = self.update(
-                price_a=float(a.iloc[i]),
-                price_b=float(b.iloc[i]),
-                volume=vol,
-                high=hi,
-                low=lo,
-            )
-            spread = st["spread"]
-            velocity = spread - prev_spread
-            prev_spread = spread
-
-            rows.append({
-                "price_a": float(a.iloc[i]),
-                "price_b": float(b.iloc[i]),
-                "alpha": st["alpha"],
-                "beta": st["beta"],
-                "spread": spread,
-                "zscore": st["zscore"],
-                "confidence": st["confidence"],
-                "spread_velocity": velocity,
-                "spread_vol": st["spread_std"],
-                "innovation": st["innovation"],
-                "R": st["R"],
-            })
-
-        df = pd.DataFrame(rows, index=common)
-
-        df["spread_velocity"] = (
-            df["spread"].diff().rolling(5, min_periods=1).mean().fillna(0)
-        )
-        df["spread_vol"] = (
-            df["spread"].rolling(15, min_periods=5).std().fillna(df["spread_vol"])
-        )
-        # Keep online z, but use rolling residual z for trading thresholds (±2)
-        df["zscore_online"] = df["zscore"]
-        roll_mu = df["spread"].rolling(40, min_periods=10).mean()
-        roll_sd = df["spread"].rolling(40, min_periods=10).std()
-        df["zscore"] = ((df["spread"] - roll_mu) / roll_sd.replace(0, np.nan)).fillna(0.0)
-        roll = df["spread"].rolling(20, min_periods=5).std()
-        med = float(roll.median()) if roll.notna().any() else 1.0
-        df["confidence"] = (med / (med + roll)).clip(self.min_conf, self.max_conf).fillna(self.min_conf)
-        return df
+# AdaptiveKalmanPairs, KalmanNoiseModel available via import above.
 
 
 
-class LogisticExitModel:
-    """
-    DEPRECATED — legacy in-process logistic (results/logistic_exit_model.json).
+# LogisticExitModel imported from src.legacy_logistic (quarantined).
 
-    Production exits use StatArbExitManager + models/*.pkl (SYSTEM_SPEC).
-    Kept for reading old artifacts and unit tests only.
-    """
-
-    def __init__(self):
-        self.weights = None
-        self.bias = 0.0
-        self.feature_names: List[str] = list(FEATURE_NAMES)
-        self.feat_mean: Optional[np.ndarray] = None
-        self.feat_std: Optional[np.ndarray] = None
-        self.schema_version: int = FEATURE_SCHEMA_VERSION
-
-    def _sigmoid(self, z):
-        return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
-
-    def _transform(self, X: np.ndarray) -> np.ndarray:
-        X = np.asarray(X, dtype=float)
-        if self.feat_mean is None or self.feat_std is None:
-            return X
-        return (X - self.feat_mean) / self.feat_std
-
-    def fit(self, X, y, reg=0.3, lr=0.1, epochs=400):
-        X = np.asarray(X, dtype=float)
-        y = np.asarray(y, dtype=float)
-        n, d = X.shape
-        self.feat_mean = X.mean(axis=0)
-        std = X.std(axis=0)
-        self.feat_std = np.where(std < 1e-8, 1.0, std)
-        Xs = self._transform(X)
-        self.weights = np.zeros(d)
-        self.bias = 0.0
-        self.schema_version = FEATURE_SCHEMA_VERSION
-        self.feature_names = list(FEATURE_NAMES)
-        for _ in range(epochs):
-            logits = Xs @ self.weights + self.bias
-            probs = self._sigmoid(logits)
-            err = probs - y
-            self.weights -= lr * ((Xs.T @ err) / n + reg * self.weights)
-            self.bias -= lr * (err.mean())
-        return self
-
-    def predict_proba(self, X):
-        X = np.asarray(X, dtype=float)
-        return self._sigmoid(self._transform(X) @ self.weights + self.bias)
-
-    def save(self, path: Path = MODEL_JSON) -> Path:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "weights": self.weights.tolist() if self.weights is not None else None,
-            "bias": float(self.bias),
-            "feature_names": self.feature_names,
-            "feat_mean": self.feat_mean.tolist() if self.feat_mean is not None else None,
-            "feat_std": self.feat_std.tolist() if self.feat_std is not None else None,
-            "schema_version": int(self.schema_version),
-        }
-        path.write_text(json.dumps(payload, indent=2))
-        return path
-
-    @classmethod
-    def load(cls, path: Path = MODEL_JSON) -> "LogisticExitModel":
-        payload = json.loads(Path(path).read_text())
-        model = cls()
-        model.weights = np.array(payload["weights"], dtype=float) if payload["weights"] else None
-        model.bias = float(payload["bias"])
-        model.feature_names = list(payload.get("feature_names", FEATURE_NAMES))
-        mean = payload.get("feat_mean")
-        std = payload.get("feat_std")
-        model.feat_mean = np.array(mean, dtype=float) if mean is not None else None
-        model.feat_std = np.array(std, dtype=float) if std is not None else None
-        model.schema_version = int(payload.get("schema_version", 1))
-        return model
 
 
 def analyze_feature_importance(model, feature_names):
@@ -897,7 +602,7 @@ class Setup:
         return row
 
 
-def get_exit_model_version(model: Optional["LogisticExitModel"] = None) -> str:
+def get_exit_model_version(model: Optional[Any] = None) -> str:
     """Simple provenance tag for the exit policy used in a research pass."""
     if model is None or getattr(model, "weights", None) is None:
         return "rules_only"
@@ -934,7 +639,7 @@ def save_setups(
 def _simulate_setups_for_pair(
     df: pd.DataFrame,
     pair: PairSpec,
-    model: Optional[LogisticExitModel],
+    model: Optional[Any],
     run_id: str,
     data_window: str = "multi_year",
     ml_threshold: float = 0.68,
@@ -952,6 +657,8 @@ def _simulate_setups_for_pair(
     Year gate: when data_window == "latest_year", entries outside trade_year
     are skipped (same idea as live/backtest). multi_year skips that gate.
     """
+    if exit_manager is None:
+        raise ValueError("exit_manager is required for research setups")
     setups: List[Setup] = []
     position = 0
     entry_idx = 0
@@ -1025,11 +732,11 @@ def _simulate_setups_for_pair(
             z=z,
             bars_held=bars_held,
             features=feat_vec,
-            model=model,
+            model=None,
             ml_threshold=ml_threshold,
             half_life=half_life,
             exit_manager=exit_manager,
-            trade_state=trade_state if exit_manager is not None else None,
+            trade_state=trade_state,
         )
         if not should_exit:
             continue
@@ -1224,94 +931,10 @@ def closed_trades_to_frame(
     return pd.DataFrame(rows)
 
 
-def _trade_fingerprint_cols() -> List[str]:
-    return ["ticker_a", "ticker_b", "direction", "entry_time", "exit_time", "broker"]
 
+# Journal helpers: _trade_fingerprint_cols, _is_wash_closed_row,
+# dedupe_journal_rows, filter_journal_by_scope — imported from src.journal.
 
-def _is_wash_closed_row(df: pd.DataFrame) -> pd.Series:
-    """Same-bar CLOSED with zero pnl_z (failed/instant reverse, not a real round-trip)."""
-    if df.empty:
-        return pd.Series(dtype=bool)
-    status = df["status"].astype(str).str.upper() if "status" in df.columns else pd.Series([""] * len(df))
-    entry = pd.to_datetime(df["entry_time"], format="mixed", errors="coerce")
-    exit_ = pd.to_datetime(df["exit_time"], format="mixed", errors="coerce")
-    pnl = pd.to_numeric(df["pnl_z"], errors="coerce") if "pnl_z" in df.columns else pd.Series(np.nan, index=df.index)
-    same_bar = entry.notna() & exit_.notna() & (entry == exit_)
-    zero_pnl = pnl.fillna(0.0).abs() < 1e-12
-    return status.eq("CLOSED") & same_bar & zero_pnl
-
-
-def dedupe_journal_rows(
-    journal: pd.DataFrame,
-    drop_wash: bool = True,
-) -> pd.DataFrame:
-    """
-    Deduplicate journal rows for sim *and* alpaca.
-
-    - drop_wash=True: remove CLOSED wash trades (entry_time == exit_time, pnl_z ≈ 0)
-      so a later OPEN for the same exposure is kept (matches brokerage).
-    - For a real close (entry != exit), CLOSED outranks OPEN on the same pair/entry.
-    - Repeated sim backtest fingerprints collapse to one row.
-    """
-    if journal is None or journal.empty:
-        return journal
-    df = journal.copy()
-    for col in ("entry_time", "exit_time"):
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], format="mixed", errors="coerce")
-
-    if drop_wash and {"entry_time", "exit_time", "status"}.issubset(df.columns):
-        wash = _is_wash_closed_row(df)
-        n_wash = int(wash.sum())
-        if n_wash:
-            print(f"⚠️  Dropped {n_wash} wash CLOSED rows (entry==exit, pnl_z≈0)")
-            df = df.loc[~wash].copy()
-
-    # Collapse identical fingerprints (includes exit_time when present)
-    fp = [c for c in _trade_fingerprint_cols() if c in df.columns]
-    if fp:
-        df = df.drop_duplicates(subset=fp, keep="last")
-
-    # Same pair + entry_time: prefer real CLOSED over OPEN; then latest run_id
-    key = [c for c in ("ticker_a", "ticker_b", "entry_time") if c in df.columns]
-    if len(key) == 3 and "status" in df.columns:
-        status = df["status"].astype(str).str.upper()
-        df = df.assign(_rank=np.where(status.eq("CLOSED"), 1, 0))
-        sort_cols = key + ["_rank"]
-        if "run_id" in df.columns:
-            sort_cols.append("run_id")
-        df = df.sort_values(sort_cols, kind="mergesort")
-        df = df.drop_duplicates(subset=key, keep="last").drop(columns=["_rank"])
-
-    sort_cols = [c for c in ("entry_time", "run_id", "trade_id") if c in df.columns]
-    if sort_cols:
-        df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
-    else:
-        df = df.reset_index(drop=True)
-    return df
-
-
-def filter_journal_by_scope(journal: pd.DataFrame, scope: str = "all") -> pd.DataFrame:
-    """
-    scope:
-      all     — keep every broker
-      alpaca  — keep broker starting with 'alpaca' only (real paper fills)
-      sim     — keep local simulator rows only
-      none    — empty frame (caller should skip writing)
-    """
-    scope = (scope or "all").lower().strip()
-    if journal is None or journal.empty:
-        return journal if journal is not None else pd.DataFrame()
-    if scope in ("none", "off", "skip"):
-        return journal.iloc[0:0].copy()
-    if scope == "all":
-        return journal
-    broker = journal["broker"].astype(str) if "broker" in journal.columns else pd.Series([""] * len(journal))
-    if scope == "alpaca":
-        return journal.loc[broker.str.lower().str.startswith("alpaca")].copy()
-    if scope == "sim":
-        return journal.loc[broker.str.lower().isin(["sim", "none", "local", ""])].copy()
-    raise ValueError(f"Unknown journal scope '{scope}'. Use all|alpaca|sim|none.")
 
 
 def save_paper_results(
@@ -1515,33 +1138,27 @@ def train_from_stored_results(
     model_path: Optional[Path] = None,
     reg: float = 0.3,
     min_samples: Optional[int] = None,
-) -> Optional[LogisticExitModel]:
+) -> None:
     """
     Train the production sklearn exit model (SYSTEM_SPEC).
 
-    Returns None on success of the sklearn path (artifacts under models/).
-    Legacy JSON LogisticExitModel is no longer written for live use.
+    Writes models/*.pkl only. Raises if labeled rows < training.min_samples.
     """
     results_dir = Path(dataset_path).parent if dataset_path else RESULTS_DIR
     cfg = load_strategy_config()
     floor = min_samples if min_samples is not None else int(
         (cfg.get("training") or {}).get("min_samples", 50)
     )
-    try:
-        meta = train_sklearn_exit_model(
-            results_dir,
-            min_samples=floor,
-            calibrate=True,
-        )
-        print(
-            f"✅ Sklearn exit model promoted "
-            f"(n={meta['metrics']['n_samples']}, "
-            f"pos_rate={meta['metrics']['class_balance']['positive_rate']:.1%})"
-        )
-        return None
-    except Exception as exc:
-        print(f"⚠️  Sklearn exit trainer skipped ({exc})")
-        raise
+    meta = train_sklearn_exit_model(
+        results_dir,
+        min_samples=floor,
+        calibrate=True,
+    )
+    print(
+        f"✅ Sklearn exit model promoted "
+        f"(n={meta['metrics']['n_samples']}, "
+        f"pos_rate={meta['metrics']['class_balance']['positive_rate']:.1%})"
+    )
 
 # ============================================================
 # PAPER TRADING ENGINE
@@ -1876,7 +1493,7 @@ def should_exit_with_ml(
     z: float,
     bars_held: int,
     features: np.ndarray,
-    model: Optional[LogisticExitModel],
+    model: Optional[Any] = None,
     ml_threshold: float = 0.68,
     force_rules: bool = True,
     half_life: float = 20.0,
@@ -1886,53 +1503,34 @@ def should_exit_with_ml(
     """
     Exit decision for an open position.
 
-    Primary path (SYSTEM_SPEC): StatArbExitManager.evaluate_trade — hard
-    time-stop / stop-loss, then ML probability ≥ threshold.
+    Requires StatArbExitManager + TradeState (fail-closed). Hard time-stop /
+    stop-loss / ML via evaluate_trade. Soft mean-reversion only when the
+    manager has no sklearn weights yet (bootstrap until N≥min_samples).
 
-    Fallback when no manager is supplied: legacy in-process logistic + soft MR.
+    `model` is ignored (legacy LogisticExitModel path removed).
     """
-    if exit_manager is not None and trade_state is not None:
-        should, reason, prob = exit_manager.evaluate_trade(trade_state)
-        if should:
+    if exit_manager is None or trade_state is None:
+        raise ValueError(
+            "exit_manager and trade_state are required; "
+            "legacy LogisticExitModel fallback is disabled"
+        )
+    if model is not None:
+        # Callers may still pass None/legacy; never use it for decisions.
+        pass
+
+    should, reason, prob = exit_manager.evaluate_trade(trade_state)
+    if should:
+        return True, float(prob)
+    # Soft mean-reversion only while sklearn weights are missing so
+    # positions can still converge before the first train.
+    if exit_manager.model is None and force_rules:
+        long_z = getattr(exit_manager, "soft_mr_long_z", -0.35)
+        short_z = getattr(exit_manager, "soft_mr_short_z", 0.35)
+        if position == 1 and z > long_z:
             return True, float(prob)
-        # Soft mean-reversion only while sklearn weights are missing so
-        # positions can still converge before the first train.
-        if exit_manager.model is None and force_rules:
-            if position == 1 and z > -0.35:
-                return True, float(prob)
-            if position == -1 and z < 0.35:
-                return True, float(prob)
-        return False, float(prob)
-
-    rule_exit = False
-    if position == 1 and z > -0.35:
-        rule_exit = True
-    if position == -1 and z < 0.35:
-        rule_exit = True
-    time_stop = time_stop_bars(half_life)
-    hard_time_stop = bars_held >= time_stop
-    if hard_time_stop:
-        rule_exit = True
-    if position == 1 and z < -3.6:
-        rule_exit = True
-    if position == -1 and z > 3.6:
-        rule_exit = True
-
-    ml_proba = None
-    if model is not None and model.weights is not None:
-        try:
-            ml_proba = float(model.predict_proba(features.reshape(1, -1))[0])
-        except Exception:
-            ml_proba = None
-
-    if ml_proba is not None:
-        if ml_proba >= ml_threshold:
-            return True, ml_proba
-        if force_rules and ml_proba < 0.38 and not hard_time_stop:
-            if abs(z) < 2.8:
-                return False, ml_proba
-
-    return rule_exit, ml_proba
+        if position == -1 and z < short_z:
+            return True, float(prob)
+    return False, float(prob)
 
 
 def _trade_pair_session(
@@ -1942,7 +1540,7 @@ def _trade_pair_session(
     min_trades: int,
     trades_remaining: int,
     trade_year: Optional[int] = None,
-    model: Optional[LogisticExitModel] = None,
+    model: Optional[Any] = None,
     ml_threshold: float = 0.68,
     mode: str = "backtest",
     latest_bar: Optional[pd.Timestamp] = None,
@@ -1957,6 +1555,8 @@ def _trade_pair_session(
       - live: warm Kalman on history, enter/exit only on the latest bar
               (this is what places Alpaca paper orders with --broker alpaca)
     """
+    if exit_manager is None:
+        raise ValueError("exit_manager is required for live/backtest exits")
     position = 0
     entry_idx = 0
     opened = 0

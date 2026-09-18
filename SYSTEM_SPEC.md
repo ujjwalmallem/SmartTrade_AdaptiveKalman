@@ -196,15 +196,20 @@ Prompt Cursor with:
 > `entry_z`, and wraps evaluation in type-checked dataclasses with unit tests
 > in `tests/test_exit_manager.py`.
 
-### Alignment with current `main` (post-PR #20)
+### Alignment with current `main` (post exit-invariants)
 
-| Spec item | Status on `main` today |
+| Spec item | Status |
 |---|---|
-| Drop `favorable` / `best_fav` / raw `entry_z` | Done (schema v2) |
-| Symmetry via absolute entry depth | Done as `entry_mag` |
-| Default threshold 0.68 | Done |
-| Time-stop `max(5, 2.5×hl)` | Done in `should_exit_with_ml` |
-| Z-score / standardize features | Done in-model (`feat_mean`/`feat_std`) |
-| Split `src/` + sklearn `joblib` artifacts + YAML config | **Not yet** — monolith `paper_trading_ml_exit.py` |
-| Lookahead labeling $H = 2.5×hl$ | Partial — current labels are rule-based at close |
-| `giveback` / `hold_vs_hl` extras | Present on `main`; not in this 8-feature table |
+| Drop `favorable` / `best_fav` / raw `entry_z` | Done (schema v3, `abs_entry_z`) |
+| Symmetry via absolute entry depth | Done as `abs_entry_z` |
+| Default threshold 0.68 | Done (`config/strategy_config.yaml` + `src/config.py`) |
+| Time-stop `max(5, 2.5×hl)` | Done in `StatArbExitManager` / `time_stop_bars` |
+| Z-score / standardize features | Done via `StandardScaler` → `models/feature_scaler.pkl` |
+| Split `src/` + sklearn `joblib` artifacts + YAML config | Done — `src/{features,exit_manager,train_exit_model,config,kalman,journal}`; monolith still hosts CLI/loop |
+| Fail-closed without `StatArbExitManager` | Done — no live/backtest/research fallback to JSON logistic |
+| Training floor `min_samples≥50` | Done — config + `train_exit_model` CLI |
+| NaN-safe ML path | Done — `evaluate_trade` holds on non-finite features |
+| Lookahead labeling $H = 2.5×hl$ | Done in `src/train_exit_model.label_path_bars` |
+| Legacy `LogisticExitModel` | Quarantined in `src/legacy_logistic.py` (tests / old JSON only) |
+| Further monolith split (`PositionState`, broker loop) | Deferred |
+

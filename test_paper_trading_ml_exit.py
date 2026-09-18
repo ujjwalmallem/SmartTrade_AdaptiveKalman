@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 import paper_trading_ml_exit as m
+from src.exit_manager import StatArbExitManager, TradeState
 
 
 class TestAdaptiveKalmanPairs(unittest.TestCase):
@@ -207,59 +208,85 @@ class TestShouldExitWithML(unittest.TestCase):
         feat[4] = conf
         return feat
 
-    def test_rule_exit_without_model(self):
+    def _state(self, *, direction=1, exit_z=-0.2, bars_held=5, half_life=20.0):
+        return TradeState(
+            trade_id=1,
+            ticker_a="AAPL",
+            ticker_b="MSFT",
+            direction="LONG_SPREAD" if direction == 1 else "SHORT_SPREAD",
+            bars_held=bars_held,
+            half_life_bars=half_life,
+            vol=1.0,
+            pnl_proxy=0.5,
+            entry_z=-2.0 if direction == 1 else 2.0,
+            confidence=0.7,
+            exit_z=exit_z,
+            velocity=0.0,
+            half_life=half_life / 30.0,
+        )
+
+    def _mgr(self, **kwargs):
+        return StatArbExitManager(model=None, scaler=None, exit_threshold=0.68, **kwargs)
+
+    def test_requires_manager(self):
+        with self.assertRaises(ValueError):
+            m.should_exit_with_ml(
+                position=1, z=-0.2, bars_held=5,
+                features=self._features(), model=None,
+            )
+
+    def test_soft_mr_without_sklearn_weights(self):
         should, proba = m.should_exit_with_ml(
             position=1, z=-0.2, bars_held=5,
             features=self._features(), model=None,
+            exit_manager=self._mgr(), trade_state=self._state(exit_z=-0.2),
         )
         self.assertTrue(should)
-        self.assertIsNone(proba)
+        self.assertIsNotNone(proba)
 
     def test_hard_time_stop(self):
         # Fixed floor: 5 bars when half_life is tiny
         should, _ = m.should_exit_with_ml(
             position=1, z=-1.5, bars_held=5,
             features=self._features(), model=None, half_life=1.0,
+            exit_manager=self._mgr(),
+            trade_state=self._state(exit_z=-1.5, bars_held=5, half_life=1.0),
         )
         self.assertTrue(should)
 
     def test_half_life_time_stop_scales(self):
         # hl=10 → stop at ceil(2.5*10)=25
+        mgr = self._mgr()
         should_early, _ = m.should_exit_with_ml(
             position=1, z=-1.5, bars_held=24,
             features=self._features(), model=None, half_life=10.0,
+            exit_manager=mgr,
+            trade_state=self._state(exit_z=-1.5, bars_held=24, half_life=10.0),
         )
         should_late, _ = m.should_exit_with_ml(
             position=1, z=-1.5, bars_held=25,
             features=self._features(), model=None, half_life=10.0,
+            exit_manager=mgr,
+            trade_state=self._state(exit_z=-1.5, bars_held=25, half_life=10.0),
         )
         self.assertFalse(should_early)
         self.assertTrue(should_late)
 
-    def test_ml_force_exit(self):
+    def test_legacy_model_ignored(self):
+        """JSON logistic must not drive exits even if passed."""
         model = m.LogisticExitModel()
-        # Craft weights so predict_proba is high for any finite feature vector
         model.weights = np.zeros(len(m.FEATURE_NAMES))
-        model.bias = 3.0  # sigmoid(3) ≈ 0.95
+        model.bias = 3.0  # would be ~0.95 if used
         should, proba = m.should_exit_with_ml(
             position=1, z=-1.5, bars_held=3,
             features=self._features(), model=model, ml_threshold=0.68,
+            exit_manager=self._mgr(),
+            trade_state=self._state(exit_z=-1.5, bars_held=3, half_life=20.0),
+            force_rules=False,
         )
-        self.assertTrue(should)
-        self.assertIsNotNone(proba)
-        self.assertGreaterEqual(proba, 0.68)
-
-    def test_ml_suppresses_soft_rule_exit(self):
-        model = m.LogisticExitModel()
-        model.weights = np.zeros(len(m.FEATURE_NAMES))
-        model.bias = -3.0  # sigmoid(-3) ≈ 0.05
-        should, proba = m.should_exit_with_ml(
-            position=1, z=-0.2, bars_held=5,  # would be soft rule exit
-            features=self._features(), model=model, ml_threshold=0.68,
-            half_life=20.0,  # time-stop at 50 — soft exit can be suppressed
-        )
+        # No sklearn weights → soft MR off (force_rules=False), deep z → HOLD
         self.assertFalse(should)
-        self.assertLess(proba, 0.38)
+        self.assertEqual(proba, 0.0)
 
 
 
@@ -451,6 +478,9 @@ class TestEndToEndYfinance(unittest.TestCase):
 
 class TestLiveMode(unittest.TestCase):
 
+    def _exit_mgr(self):
+        return StatArbExitManager(model=None, scaler=None, exit_threshold=0.68)
+
     def test_live_skips_reentry_when_alpaca_exposed(self):
         from alpaca_paper_broker import AlpacaPaperBroker
         br = AlpacaPaperBroker(paper=True, dry_run=True)
@@ -476,6 +506,7 @@ class TestLiveMode(unittest.TestCase):
         m._trade_pair_session(
             trader, df, pair, min_trades=1, trades_remaining=1,
             trade_year=2026, mode="live", latest_bar=idx[-1],
+            exit_manager=self._exit_mgr(),
         )
         self.assertEqual(calls["n"], 0)
         self.assertTrue(any(tr.status == "OPEN" and tr.broker == "alpaca_paper" for tr in trader.trades))
@@ -500,6 +531,7 @@ class TestLiveMode(unittest.TestCase):
         m._trade_pair_session(
             trader, df, pair, min_trades=1, trades_remaining=1,
             trade_year=2026, mode="live", latest_bar=idx[-1],
+            exit_manager=self._exit_mgr(),
         )
         self.assertGreaterEqual(len(trader.trades), 1)
         for tr in trader.trades:
@@ -525,6 +557,7 @@ class TestLiveMode(unittest.TestCase):
         m._trade_pair_session(
             trader, df, pair, min_trades=1, trades_remaining=1,
             trade_year=2026, mode="live", latest_bar=idx[-1],
+            exit_manager=self._exit_mgr(),
         )
         self.assertEqual(len(trader.trades), 1)
         self.assertEqual(trader.trades[0].status, "OPEN")
@@ -840,6 +873,9 @@ class TestAlpacaBroker(unittest.TestCase):
 
 class TestResearchMode(unittest.TestCase):
 
+    def _exit_mgr(self):
+        return StatArbExitManager(model=None, scaler=None, exit_threshold=0.68)
+
     def _synthetic_pair_frame(self, n: int = 100) -> pd.DataFrame:
         idx = pd.date_range("2025-06-02", periods=n, freq="B")
         z = np.zeros(n)
@@ -863,6 +899,7 @@ class TestResearchMode(unittest.TestCase):
         pair = m.PairSpec(ticker_a="AAPL", ticker_b="MSFT", basket="mag7")
         setups = m._simulate_setups_for_pair(
             df, pair, model=None, run_id="TEST", data_window="multi_year",
+            exit_manager=self._exit_mgr(),
         )
         self.assertGreaterEqual(len(setups), 1)
         for s in setups:
@@ -881,6 +918,7 @@ class TestResearchMode(unittest.TestCase):
         setups = m._simulate_setups_for_pair(
             df, pair, model=None, run_id="TEST",
             data_window="latest_year", trade_year=2026,
+            exit_manager=self._exit_mgr(),
         )
         self.assertEqual(len(setups), 0)
 
