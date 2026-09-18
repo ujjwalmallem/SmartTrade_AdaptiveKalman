@@ -1633,6 +1633,7 @@ def _trade_pair_session(
     mode: str = "backtest",
     latest_bar: Optional[pd.Timestamp] = None,
     exit_manager: Optional[StatArbExitManager] = None,
+    force_rules: bool = True,
 ) -> int:
     """
     Run rule-based entries + ML-augmented exits on one pair.
@@ -1833,6 +1834,7 @@ def _trade_pair_session(
                 model=model,
                 ml_threshold=ml_threshold,
                 half_life=half_life,
+                force_rules=force_rules,
                 exit_manager=exit_manager,
                 trade_state=trade_state,
             )
@@ -1894,6 +1896,7 @@ def run_paper_trading_and_train(
     data_window: str = "multi_year",
     journal_scope: str = "alpaca",
     replace_training: bool = False,
+    force_rules: bool = True,
 ):
     mode = (mode or "backtest").lower().strip()
     if mode not in ("backtest", "live", "research"):
@@ -1924,7 +1927,11 @@ def run_paper_trading_and_train(
         print("Backtest: replay history for the ML journal (Alpaca orders only if a fill hits latest bar)")
         print("Goal: Complete at least", min_trades, "round-trip trades\n")
         if replace_training:
-            print("Harvest: replace exit_training_dataset.csv (paper_trades untouched if scope=none)\n")
+            print("Harvest: replace exit_training_dataset.csv (paper_trades untouched if scope=none)")
+            if not force_rules:
+                print("Harvest exits: hard stops only (no soft MR) for label diversity\n")
+            else:
+                print()
 
     # 0. Universe — Mag7, semis, memory, hyperscaler
     baskets = list(baskets) if baskets is not None else list(TICKER_UNIVERSES.keys())
@@ -2014,6 +2021,7 @@ def run_paper_trading_and_train(
             mode=mode,
             latest_bar=latest_bar,
             exit_manager=exit_manager,
+            force_rules=force_rules,
         )
         closed_count += opened
 
@@ -2194,7 +2202,7 @@ if __name__ == "__main__":
             args.min_trades = 80
         print(
             f"🌾 Harvest training: backtest sim → replace dataset "
-            f"(min_trades={args.min_trades}, journal untouched)"
+            f"(min_trades={args.min_trades}, journal untouched, hard-stops only)"
         )
 
     if args.mode == "live" and args.broker == "sim":
@@ -2215,6 +2223,8 @@ if __name__ == "__main__":
         thr = args.ml_threshold
         if thr is None:
             thr = config_exit_threshold()
+        # Harvest: disable soft MR so labels aren't all "good exit" winners
+        harvest_force_rules = not args.harvest_training
         trader, exit_mgr, data = run_paper_trading_and_train(
             n_bars=args.n_bars,
             min_trades=args.min_trades,
@@ -2230,6 +2240,7 @@ if __name__ == "__main__":
             data_window=args.data_window,
             journal_scope=args.save_journal,
             replace_training=args.replace_training,
+            force_rules=harvest_force_rules,
         )
 
         if args.mode == "research":
