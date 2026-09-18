@@ -47,6 +47,25 @@ FEATURE_NAMES = [
     "hold_vs_hl",      # bars_held / half_life — duration vs mean-reversion scale
 ]
 FEATURE_SCHEMA_VERSION = 2
+DEFAULT_ML_EXIT_THRESHOLD = 0.68
+
+
+def default_ml_exit_threshold() -> float:
+    """
+    Live ML exit probability threshold.
+
+    Override with env ML_EXIT_THRESHOLD (e.g. 0.60–0.75 grid search) or --ml-threshold.
+    """
+    raw = os.environ.get("ML_EXIT_THRESHOLD", "").strip()
+    if not raw:
+        return DEFAULT_ML_EXIT_THRESHOLD
+    try:
+        val = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"ML_EXIT_THRESHOLD must be a float, got {raw!r}") from exc
+    if not (0.0 < val < 1.0):
+        raise ValueError(f"ML_EXIT_THRESHOLD must be in (0, 1), got {val}")
+    return val
 
 # ============================================================
 # PASTE ALL PREVIOUS CLASSES HERE (or keep them in the same file)
@@ -954,7 +973,7 @@ def _simulate_setups_for_pair(
     model: Optional[LogisticExitModel],
     run_id: str,
     data_window: str = "multi_year",
-    ml_threshold: float = 0.68,
+    ml_threshold: float = DEFAULT_ML_EXIT_THRESHOLD,
     capital: float = 100_000.0,
     risk_frac: float = 0.08,
     cost_bps: float = 4.0,
@@ -1085,7 +1104,7 @@ def run_research_setups(
     baskets: Optional[Sequence[str]] = None,
     include_cross: bool = True,
     max_pairs_per_basket: int = 6,
-    ml_threshold: float = 0.68,
+    ml_threshold: float = DEFAULT_ML_EXIT_THRESHOLD,
     noise_model: KalmanNoiseModel | str = KalmanNoiseModel.STANDARD,
     data_source: str = "auto",
     data_window: str = "multi_year",
@@ -1812,7 +1831,7 @@ def should_exit_with_ml(
     bars_held: int,
     features: np.ndarray,
     model: Optional[LogisticExitModel],
-    ml_threshold: float = 0.68,
+    ml_threshold: float = DEFAULT_ML_EXIT_THRESHOLD,
     force_rules: bool = True,
     half_life: float = 20.0,
 ) -> Tuple[bool, Optional[float]]:
@@ -1871,7 +1890,7 @@ def _trade_pair_session(
     trades_remaining: int,
     trade_year: Optional[int] = None,
     model: Optional[LogisticExitModel] = None,
-    ml_threshold: float = 0.68,
+    ml_threshold: float = DEFAULT_ML_EXIT_THRESHOLD,
     mode: str = "backtest",
     latest_bar: Optional[pd.Timestamp] = None,
 ) -> int:
@@ -2108,7 +2127,7 @@ def run_paper_trading_and_train(
     baskets: Optional[Sequence[str]] = None,
     include_cross: bool = True,
     max_pairs_per_basket: int = 6,
-    ml_threshold: float = 0.68,
+    ml_threshold: float = DEFAULT_ML_EXIT_THRESHOLD,
     noise_model: KalmanNoiseModel | str = KalmanNoiseModel.STANDARD,
     broker: str = "sim",
     alpaca_latest_only: bool = True,
@@ -2318,8 +2337,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ml-threshold",
         type=float,
-        default=0.68,
-        help="ML exit probability threshold for forced exits (default 0.68)",
+        default=None,
+        help=(
+            "ML exit probability threshold for forced exits "
+            f"(default {DEFAULT_ML_EXIT_THRESHOLD}, or env ML_EXIT_THRESHOLD)"
+        ),
     )
     parser.add_argument(
         "--noise-model",
@@ -2375,6 +2397,8 @@ if __name__ == "__main__":
         ),
     )
     args = parser.parse_args()
+    if args.ml_threshold is None:
+        args.ml_threshold = default_ml_exit_threshold()
 
     if args.mode == "live" and args.broker == "sim":
         print("ℹ️  Live mode with --broker sim will not place Alpaca orders. Use --broker alpaca.")

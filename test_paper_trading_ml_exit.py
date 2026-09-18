@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -221,6 +222,30 @@ class TestShouldExitWithML(unittest.TestCase):
         feat[2] = pnl
         feat[4] = conf
         return feat
+
+    def test_default_ml_exit_threshold_env(self):
+        old = os.environ.pop("ML_EXIT_THRESHOLD", None)
+        try:
+            self.assertEqual(m.default_ml_exit_threshold(), m.DEFAULT_ML_EXIT_THRESHOLD)
+            os.environ["ML_EXIT_THRESHOLD"] = "0.72"
+            self.assertAlmostEqual(m.default_ml_exit_threshold(), 0.72)
+            os.environ["ML_EXIT_THRESHOLD"] = "1.5"
+            with self.assertRaises(ValueError):
+                m.default_ml_exit_threshold()
+        finally:
+            if old is None:
+                os.environ.pop("ML_EXIT_THRESHOLD", None)
+            else:
+                os.environ["ML_EXIT_THRESHOLD"] = old
+
+    def test_time_stop_uses_max_not_min(self):
+        # Bug guard: min(5, 2.5*hl) would always cap at 5 and force early exits.
+        # hl=10 → allowed hold up to 25 bars.
+        should, _ = m.should_exit_with_ml(
+            position=1, z=-1.5, bars_held=10,
+            features=self._features(), model=None, half_life=10.0,
+        )
+        self.assertFalse(should)
 
     def test_rule_exit_without_model(self):
         should, proba = m.should_exit_with_ml(
