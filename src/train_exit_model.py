@@ -29,7 +29,7 @@ from src.features import (
     frame_to_matrix,
     save_scaler,
 )
-from src.exit_manager import load_strategy_config
+from src.config import load_strategy_config, training_min_samples
 
 DEFAULT_CONFIG = Path("config/strategy_config.yaml")
 DEFAULT_RESULTS = Path("results")
@@ -185,11 +185,11 @@ def train_exit_model(
     *,
     config_path: Union[str, Path] = DEFAULT_CONFIG,
     calibrate: bool = True,
-    min_samples: int = 4,
+    min_samples: Optional[int] = None,
     test_size: float = 0.25,
     random_state: int = 42,
-    penalty: str = "l2",
-    C: float = 1.0,
+    penalty: Optional[str] = None,
+    C: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Fit StandardScaler + LogisticRegression (+ optional calibration).
@@ -199,6 +199,15 @@ def train_exit_model(
     cfg = load_strategy_config(config_path)
     exit_cfg = cfg.get("exit_model") or {}
     risk_cfg = cfg.get("risk_engine") or {}
+    train_cfg = cfg.get("training") or {}
+
+    if min_samples is None:
+        min_samples = training_min_samples(cfg)
+    if penalty is None:
+        penalty = str(train_cfg.get("penalty", "l2"))
+    if C is None:
+        C = float(train_cfg.get("C", 1.0))
+    calibrate_floor = int(train_cfg.get("calibrate_min_samples", 8))
 
     model_path = Path(exit_cfg.get("model_path", "models/logistic_exit_model.pkl"))
     scaler_path = Path(exit_cfg.get("scaler_path", "models/feature_scaler.pkl"))
@@ -238,7 +247,7 @@ def train_exit_model(
     )
     base.fit(X_train, y_train)
 
-    if calibrate and len(X_train) >= 8:
+    if calibrate and len(X_train) >= calibrate_floor:
         model: Any = CalibratedClassifierCV(base, method="sigmoid", cv=3)
         model.fit(X_train, y_train)
     else:
@@ -250,6 +259,11 @@ def train_exit_model(
         "n_samples": int(len(y)),
         "n_train": int(len(y_train)),
         "n_test": int(len(y_test)),
+        "class_balance": {
+            "label_0": int((y == 0).sum()),
+            "label_1": int((y == 1).sum()),
+            "positive_rate": float(y.mean()),
+        },
         "accuracy": float(accuracy_score(y_test, pred)),
     }
     try:
@@ -267,7 +281,8 @@ def train_exit_model(
         "schema_version": FEATURE_SCHEMA_VERSION,
         "penalty": penalty,
         "C": C,
-        "calibrated": bool(calibrate and len(X_train) >= 8),
+        "calibrated": bool(calibrate and len(X_train) >= calibrate_floor),
+        "min_samples_required": int(min_samples),
         "probability_threshold": float(exit_cfg.get("probability_threshold", 0.68)),
         "metrics": metrics,
         "model_path": str(model_path),
@@ -291,7 +306,8 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--no-calibrate", action="store_true")
     p.add_argument("--penalty", choices=["l1", "l2"], default="l2")
     p.add_argument("--C", type=float, default=1.0)
-    p.add_argument("--min-samples", type=int, default=4)
+    p.add_argument("--min-samples", type=int, default=None,
+                   help="Override config training.min_samples (default 50)")
     args = p.parse_args(argv)
     train_exit_model(
         args.results_dir,

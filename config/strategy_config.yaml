@@ -1,19 +1,44 @@
 strategy:
   name: "kalman_statarb_pairs"
-  version: "2.1.0"
+  version: "2.2.0"
 
 exit_model:
   model_path: "models/logistic_exit_model.pkl"
   scaler_path: "models/feature_scaler.pkl"
   metadata_path: "models/model_metadata.json"
+  # Single source of truth for live / backtest / research
   probability_threshold: 0.68
+  # Prefer sklearn StatArbExitManager artifacts; legacy JSON path is deprecated
+  backend: "sklearn"  # sklearn | legacy_json
+
+training:
+  min_samples: 50
+  calibrate_min_samples: 8
+  good_pnl_threshold: 0.35
+  penalty: "l2"
+  C: 1.0
 
 risk_engine:
   max_half_life_multiplier: 2.5
   absolute_min_bars: 5          # floor for time-stop (NOT a cap)
   stop_loss_z: 4.0
   hard_pnl_stop_dollars: -150.00
+  # Soft mean-reversion fallback only when sklearn weights are missing
+  soft_mr_long_z: -0.35
+  soft_mr_short_z: 0.35
+
+entry:
+  z_entry: 2.0
+  min_confidence: 0.55
 
 execution:
   broker: "alpaca_paper"  # or alpaca_live
   order_type: "market"
+  cost_bps: 4.0
+  risk_frac: 0.08
+  capital: 100000.0
+
+kalman:
+  delta: 1.0e-4
+  R_base: 1.0e-2
+  noise_model: "standard"  # standard | volume | parkinson

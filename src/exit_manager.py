@@ -12,15 +12,20 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import joblib
 import numpy as np
-import yaml
 
 from src.features import FEATURE_NAMES, load_scaler, transform_features
-
-DEFAULT_CONFIG_PATH = Path("config/strategy_config.yaml")
+from src.config import load_strategy_config, DEFAULT_CONFIG_PATH
 
 
 @dataclass
 class TradeState:
+    """
+    Open-position snapshot for evaluate_trade.
+
+    half_life_bars: raw OU half-life in bars (time-stop uses this).
+    half_life: normalized feature value (bars / 30) for the classifier only.
+    """
+
     trade_id: int
     ticker_a: str
     ticker_b: str
@@ -33,7 +38,7 @@ class TradeState:
     confidence: float
     exit_z: float
     velocity: float
-    half_life: float
+    half_life: float  # normalized feature (= half_life_bars / 30)
     cost_dollars: float = 0.0
     pnl_dollars: float = 0.0
 
@@ -47,22 +52,6 @@ class TradeState:
             return 1 if int(float(d)) >= 0 else -1
         except ValueError as exc:
             raise ValueError(f"Unknown direction {self.direction!r}") from exc
-
-
-def load_strategy_config(path: Union[str, Path] = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
-    path = Path(path)
-    if not path.exists():
-        return {
-            "exit_model": {"probability_threshold": 0.68},
-            "risk_engine": {
-                "max_half_life_multiplier": 2.5,
-                "absolute_min_bars": 5,
-                "stop_loss_z": 4.0,
-                "hard_pnl_stop_dollars": -150.0,
-            },
-        }
-    with path.open() as f:
-        return yaml.safe_load(f) or {}
 
 
 def time_stop_bars(
@@ -193,7 +182,11 @@ class StatArbExitManager:
             return False, "HOLD (no exit model loaded)", 0.0
 
         raw = self._raw_feature_row(state)
+        if not np.isfinite(raw).all():
+            return False, "HOLD (non-finite features — skip ML)", 0.0
         scaled = transform_features(self.scaler, raw)
+        if not np.isfinite(scaled).all():
+            return False, "HOLD (non-finite scaled features — skip ML)", 0.0
         proba = self.model.predict_proba(scaled)[0]
         # binary classifier: column 1 = P(exit / class 1)
         prob_exit = float(proba[1] if len(proba) > 1 else proba[0])
