@@ -182,7 +182,11 @@ class StatArbExitManager:
             return False, "HOLD (no exit model loaded)", 0.0
 
         raw = self._raw_feature_row(state)
+        if not np.isfinite(raw).all():
+            return False, "HOLD (non-finite features — skip ML)", 0.0
         scaled = transform_features(self.scaler, raw)
+        if not np.isfinite(scaled).all():
+            return False, "HOLD (non-finite scaled features — skip ML)", 0.0
         proba = self.model.predict_proba(scaled)[0]
         # binary classifier: column 1 = P(exit / class 1)
         prob_exit = float(proba[1] if len(proba) > 1 else proba[0])
