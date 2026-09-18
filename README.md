@@ -14,7 +14,11 @@ python paper_trading_ml_exit.py --data-source auto             # Alpaca primary,
 python paper_trading_ml_exit.py --data-source yfinance         # force Yahoo backup
 python paper_trading_ml_exit.py --noise-model volume
 python paper_trading_ml_exit.py --train-only
+# SYSTEM_SPEC sklearn exit model (writes models/*.pkl)
+PYTHONPATH=. python -m src.train_exit_model --results-dir results
 ```
+
+**Exit stack (see `SYSTEM_SPEC.md`):** Kalman state → engine time-stop / stop-loss → `StatArbExitManager` logistic probability (≥ 0.68). Features live in `src/features.py`; config in `config/strategy_config.yaml`.
 
 **Modes:**
 - `live` — latest-bar Alpaca paper orders only (preferred path for real paper fills)
@@ -61,7 +65,8 @@ Historical bars still drive Kalman / ML training in-process; only the most recen
 
 Artifacts land in `results/` (gitignored):
 - `paper_trades.csv` (includes z-PnL, $-PnL after costs, notional)
-- `exit_training_dataset.csv` (smarter exit labels; feature schema v2: `entry_mag`, `pnl_z`, `giveback`, `hold_vs_hl`, …)
+- `exit_training_dataset.csv` (SYSTEM_SPEC 8-feature set + labels)
+- `models/logistic_exit_model.pkl` + `models/feature_scaler.pkl` (sklearn exit path)
 - `logistic_exit_model.json`
 
 ## Scheduler: Cursor Automations (primary)
