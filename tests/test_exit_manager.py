@@ -119,6 +119,42 @@ class TestStatArbExitManager(unittest.TestCase):
         self.assertFalse(should)
         self.assertIn("no exit model", reason)
 
+    def test_paper_loop_hooks_evaluate_trade(self):
+        """Open-position exits go through StatArbExitManager.evaluate_trade."""
+        import paper_trading_ml_exit as m
+
+        calls = {"n": 0}
+        real_eval = StatArbExitManager.evaluate_trade
+
+        def wrapped(self, state):
+            calls["n"] += 1
+            return real_eval(self, state)
+
+        StatArbExitManager.evaluate_trade = wrapped  # type: ignore
+        try:
+            mgr = StatArbExitManager(model=None, scaler=None, exit_threshold=0.68)
+            pos = m.PositionState(direction=-1, entry_z=2.4, entry_bar=0, entry_spread=1.0)
+            row = pd.Series({
+                "zscore": 1.0, "confidence": 0.7,
+                "spread_velocity": -0.1, "spread_vol": 1.2,
+            })
+            pair = m.PairSpec(ticker_a="QCOM", ticker_b="AVGO", basket="semis")
+            state = m.build_trade_state(
+                pair=pair, direction=-1, pos_state=pos, row=row,
+                bars_held=2, half_life=20.0,
+            )
+            should, proba = m.should_exit_with_ml(
+                position=-1, z=1.0, bars_held=2,
+                features=np.zeros(len(m.FEATURE_NAMES)),
+                model=None, ml_threshold=0.68, half_life=20.0,
+                exit_manager=mgr, trade_state=state,
+            )
+            self.assertEqual(calls["n"], 1)
+            self.assertIsInstance(should, bool)
+            self.assertIsNotNone(proba)
+        finally:
+            StatArbExitManager.evaluate_trade = real_eval  # type: ignore
+
 
 class TestTrainExitModel(unittest.TestCase):
     def test_label_path_bars_lookahead(self):

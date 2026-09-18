@@ -29,6 +29,7 @@ from src.features import (
     FEATURE_NAMES as SPEC_FEATURE_NAMES,
     FEATURE_SCHEMA_VERSION as SPEC_FEATURE_SCHEMA_VERSION,
     features_from_row as spec_features_from_row,
+    extract_feature_dict,
 )
 from src.exit_manager import StatArbExitManager, TradeState, time_stop_bars
 from src.train_exit_model import train_exit_model as train_sklearn_exit_model
@@ -936,6 +937,7 @@ def _simulate_setups_for_pair(
     cost_bps: float = 4.0,
     z_to_pct: float = 0.01,
     trade_year: Optional[int] = None,
+    exit_manager: Optional[StatArbExitManager] = None,
 ) -> List[Setup]:
     """
     Research mode: walk the window and simulate every valid z-crossing to
@@ -1004,6 +1006,14 @@ def _simulate_setups_for_pair(
         feat_vec = extract_exit_features(
             pos_state, row, bars_held, position, half_life=half_life
         )
+        trade_state = build_trade_state(
+            pair=pair,
+            direction=position,
+            pos_state=pos_state,
+            row=row,
+            bars_held=bars_held,
+            half_life=half_life,
+        )
         should_exit, ml_proba = should_exit_with_ml(
             position=position,
             z=z,
@@ -1012,6 +1022,8 @@ def _simulate_setups_for_pair(
             model=model,
             ml_threshold=ml_threshold,
             half_life=half_life,
+            exit_manager=exit_manager,
+            trade_state=trade_state if exit_manager is not None else None,
         )
         if not should_exit:
             continue
@@ -1128,6 +1140,8 @@ def run_research_setups(
     else:
         print("ℹ️  No saved exit model — rules-only research exits")
 
+    exit_manager = load_exit_manager(ml_threshold=ml_threshold)
+
     run_id = pd.Timestamp.now("UTC").strftime("%Y%m%dT%H%M%SZ")
     kf = AdaptiveKalmanPairs(delta=1e-4, R_base=1e-2, noise_model=noise_model)
     all_setups: List[Setup] = []
@@ -1154,6 +1168,7 @@ def run_research_setups(
             data_window=data_window,
             ml_threshold=ml_threshold,
             trade_year=trade_year,
+            exit_manager=exit_manager,
         )
         print(f"   setups: {len(pair_setups)}")
         all_setups.extend(pair_setups)
@@ -1794,6 +1809,70 @@ class PaperTrader:
 # MAIN PAPER TRADING + TRAINING LOOP
 # ============================================================
 
+def build_trade_state(
+    *,
+    pair: PairSpec,
+    direction: int,
+    pos_state: PositionState,
+    row: pd.Series,
+    bars_held: int,
+    half_life: float,
+    trade_id: int = 0,
+    cost_dollars: float = 0.0,
+    pnl_dollars: float = 0.0,
+) -> TradeState:
+    """Map Kalman bar + open position → SYSTEM_SPEC TradeState for evaluate_trade."""
+    z = float(row["zscore"])
+    feats = extract_feature_dict(
+        entry_z=float(pos_state.entry_z),
+        current_z=z,
+        direction=int(direction),
+        vol=float(row.get("spread_vol", 1.0)),
+        confidence=float(row.get("confidence", 0.5)),
+        velocity=float(row.get("z_velocity", row.get("spread_velocity", 0.0))),
+        bars_held=int(bars_held),
+        half_life=float(half_life),
+    )
+    return TradeState(
+        trade_id=int(trade_id),
+        ticker_a=pair.ticker_a,
+        ticker_b=pair.ticker_b,
+        direction="LONG_SPREAD" if int(direction) == 1 else "SHORT_SPREAD",
+        bars_held=int(bars_held),
+        half_life_bars=float(half_life),
+        vol=feats["vol"],
+        pnl_proxy=feats["pnl_proxy"],
+        entry_z=float(pos_state.entry_z),
+        confidence=feats["confidence"],
+        exit_z=feats["exit_z"],
+        velocity=feats["velocity"],
+        half_life=feats["half_life"],
+        cost_dollars=float(cost_dollars),
+        pnl_dollars=float(pnl_dollars),
+    )
+
+
+def load_exit_manager(
+    ml_threshold: float = 0.68,
+    config_path: Path | str = "config/strategy_config.yaml",
+) -> StatArbExitManager:
+    """Load StatArbExitManager from YAML + optional sklearn artifacts."""
+    mgr = StatArbExitManager.from_config(config_path)
+    mgr.exit_threshold = float(ml_threshold)
+    if mgr.model is not None and mgr.scaler is not None:
+        print(
+            f"✅ StatArbExitManager ready "
+            f"(threshold={mgr.exit_threshold}, time-stop=max("
+            f"{mgr.absolute_min_bars}, {mgr.max_half_life_multiplier}×hl))"
+        )
+    else:
+        print(
+            "ℹ️  StatArbExitManager active without sklearn weights — "
+            "hard time-stop / stop-loss only until models/*.pkl exist"
+        )
+    return mgr
+
+
 def should_exit_with_ml(
     position: int,
     z: float,
@@ -1807,14 +1886,25 @@ def should_exit_with_ml(
     trade_state: Optional[TradeState] = None,
 ) -> Tuple[bool, Optional[float]]:
     """
-    Combine classic mean-reversion / time / stop rules with ML probability.
+    Exit decision for an open position.
 
-    Prefer StatArbExitManager (SYSTEM_SPEC) when provided; otherwise fall back
-    to the in-process LogisticExitModel + engine time-stop.
+    Primary path (SYSTEM_SPEC): StatArbExitManager.evaluate_trade — hard
+    time-stop / stop-loss, then ML probability ≥ threshold.
+
+    Fallback when no manager is supplied: legacy in-process logistic + soft MR.
     """
     if exit_manager is not None and trade_state is not None:
-        should, _reason, prob = exit_manager.evaluate_trade(trade_state)
-        return should, float(prob)
+        should, reason, prob = exit_manager.evaluate_trade(trade_state)
+        if should:
+            return True, float(prob)
+        # Soft mean-reversion only while sklearn weights are missing so
+        # positions can still converge before the first train.
+        if exit_manager.model is None and force_rules:
+            if position == 1 and z > -0.35:
+                return True, float(prob)
+            if position == -1 and z < 0.35:
+                return True, float(prob)
+        return False, float(prob)
 
     rule_exit = False
     if position == 1 and z > -0.35:
@@ -1858,6 +1948,7 @@ def _trade_pair_session(
     ml_threshold: float = 0.68,
     mode: str = "backtest",
     latest_bar: Optional[pd.Timestamp] = None,
+    exit_manager: Optional[StatArbExitManager] = None,
 ) -> int:
     """
     Run rule-based entries + ML-augmented exits on one pair.
@@ -2035,6 +2126,38 @@ def _trade_pair_session(
                 half_life=half_life,
             )
 
+            # Mark-to-market $ PnL for hard dollar stop (SYSTEM_SPEC risk_engine)
+            open_t = next(
+                (t for t in reversed(trader.trades) if t.status == "OPEN"),
+                None,
+            )
+            pnl_dollars = 0.0
+            cost_dollars = 0.0
+            trade_id = 0
+            if open_t is not None:
+                trade_id = int(open_t.trade_id)
+                cost_dollars = float(open_t.cost_dollars or 0.0)
+                notional = float(open_t.notional or 0.0)
+                pnl_z = (
+                    z - float(pos_state.entry_z)
+                    if position == 1
+                    else float(pos_state.entry_z) - z
+                )
+                # Same z→$ mapping as close_trade (approx 1% per z-unit)
+                pnl_dollars = pnl_z * 0.01 * notional - cost_dollars
+
+            trade_state = build_trade_state(
+                pair=pair,
+                direction=position,
+                pos_state=pos_state,
+                row=row,
+                bars_held=bars_held,
+                half_life=half_life,
+                trade_id=trade_id,
+                cost_dollars=cost_dollars,
+                pnl_dollars=pnl_dollars,
+            )
+
             should_exit, ml_proba = should_exit_with_ml(
                 position=position,
                 z=z,
@@ -2043,6 +2166,8 @@ def _trade_pair_session(
                 model=model,
                 ml_threshold=ml_threshold,
                 half_life=half_life,
+                exit_manager=exit_manager,
+                trade_state=trade_state,
             )
 
             if should_exit:
@@ -2181,6 +2306,9 @@ def run_paper_trading_and_train(
     else:
         print("ℹ️  No saved exit model yet — rule-only exits this session")
 
+    # SYSTEM_SPEC exit governor (time-stop / stop-loss / ML threshold)
+    exit_manager = load_exit_manager(ml_threshold=ml_threshold)
+
     # 2–3. Adaptive Kalman filter + paper trader (optional Alpaca paper brokerage)
     broker_client = build_broker(broker, dry_run=alpaca_dry_run)
     latest_bar = pd.Timestamp(prices.index.max())
@@ -2234,6 +2362,7 @@ def run_paper_trading_and_train(
             ml_threshold=ml_threshold,
             mode=mode,
             latest_bar=latest_bar,
+            exit_manager=exit_manager,
         )
         closed_count += opened
 

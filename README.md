@@ -14,7 +14,11 @@ python paper_trading_ml_exit.py --data-source auto             # Alpaca primary,
 python paper_trading_ml_exit.py --data-source yfinance         # force Yahoo backup
 python paper_trading_ml_exit.py --noise-model volume
 python paper_trading_ml_exit.py --train-only
+# SYSTEM_SPEC sklearn exit model (writes models/*.pkl)
+PYTHONPATH=. python -m src.train_exit_model --results-dir results
 ```
+
+**Exit stack (see `SYSTEM_SPEC.md`):** Kalman state → engine time-stop / stop-loss → `StatArbExitManager` logistic probability (≥ 0.68). Features live in `src/features.py`; config in `config/strategy_config.yaml`.
 
 **Modes:**
 - `live` — latest-bar Alpaca paper orders only (preferred path for real paper fills)
