@@ -954,7 +954,7 @@ def _simulate_setups_for_pair(
     model: Optional[LogisticExitModel],
     run_id: str,
     data_window: str = "multi_year",
-    ml_threshold: float = 0.62,
+    ml_threshold: float = 0.68,
     capital: float = 100_000.0,
     risk_frac: float = 0.08,
     cost_bps: float = 4.0,
@@ -1033,6 +1033,7 @@ def _simulate_setups_for_pair(
             features=feat_vec,
             model=model,
             ml_threshold=ml_threshold,
+            half_life=half_life,
         )
         if not should_exit:
             continue
@@ -1084,7 +1085,7 @@ def run_research_setups(
     baskets: Optional[Sequence[str]] = None,
     include_cross: bool = True,
     max_pairs_per_basket: int = 6,
-    ml_threshold: float = 0.62,
+    ml_threshold: float = 0.68,
     noise_model: KalmanNoiseModel | str = KalmanNoiseModel.STANDARD,
     data_source: str = "auto",
     data_window: str = "multi_year",
@@ -1811,11 +1812,15 @@ def should_exit_with_ml(
     bars_held: int,
     features: np.ndarray,
     model: Optional[LogisticExitModel],
-    ml_threshold: float = 0.62,
+    ml_threshold: float = 0.68,
     force_rules: bool = True,
+    half_life: float = 20.0,
 ) -> Tuple[bool, Optional[float]]:
     """
     Combine classic mean-reversion / time / stop rules with ML probability.
+
+    Time-stop is engine-level (not ML): force-close at max(5, 2.5 × half_life) bars
+    so stale / non-reverting pairs free capital even when duration features are weak.
 
     Returns
     -------
@@ -1827,7 +1832,10 @@ def should_exit_with_ml(
         rule_exit = True
     if position == -1 and z < 0.35:
         rule_exit = True
-    if bars_held >= 28:                     # hard time stop
+    # Hard time-stop: 2.5×OU half-life, floored at 5 trading days
+    time_stop_bars = int(max(5, np.ceil(2.5 * float(half_life))))
+    hard_time_stop = bars_held >= time_stop_bars
+    if hard_time_stop:
         rule_exit = True
     if position == 1 and z < -3.6:          # adverse stop
         rule_exit = True
@@ -1847,8 +1855,8 @@ def should_exit_with_ml(
         if ml_proba >= ml_threshold:
             return True, ml_proba
         # Low probability → optionally suppress a soft rule exit
-        # (keep hard stops & time stop)
-        if force_rules and ml_proba < 0.38 and bars_held < 22:
+        # (keep hard stops & half-life time stop)
+        if force_rules and ml_proba < 0.38 and not hard_time_stop:
             if abs(z) < 2.8:          # only suppress mild mean-reversion exits
                 return False, ml_proba
 
@@ -1863,7 +1871,7 @@ def _trade_pair_session(
     trades_remaining: int,
     trade_year: Optional[int] = None,
     model: Optional[LogisticExitModel] = None,
-    ml_threshold: float = 0.62,
+    ml_threshold: float = 0.68,
     mode: str = "backtest",
     latest_bar: Optional[pd.Timestamp] = None,
 ) -> int:
@@ -2050,6 +2058,7 @@ def _trade_pair_session(
                 features=features,
                 model=model,
                 ml_threshold=ml_threshold,
+                half_life=half_life,
             )
 
             if should_exit:
@@ -2099,7 +2108,7 @@ def run_paper_trading_and_train(
     baskets: Optional[Sequence[str]] = None,
     include_cross: bool = True,
     max_pairs_per_basket: int = 6,
-    ml_threshold: float = 0.62,
+    ml_threshold: float = 0.68,
     noise_model: KalmanNoiseModel | str = KalmanNoiseModel.STANDARD,
     broker: str = "sim",
     alpaca_latest_only: bool = True,
@@ -2309,8 +2318,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ml-threshold",
         type=float,
-        default=0.62,
-        help="ML exit probability threshold for forced exits (default 0.62)",
+        default=0.68,
+        help="ML exit probability threshold for forced exits (default 0.68)",
     )
     parser.add_argument(
         "--noise-model",

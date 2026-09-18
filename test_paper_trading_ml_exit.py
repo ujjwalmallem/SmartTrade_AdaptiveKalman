@@ -231,11 +231,25 @@ class TestShouldExitWithML(unittest.TestCase):
         self.assertIsNone(proba)
 
     def test_hard_time_stop(self):
+        # Fixed floor: 5 bars when half_life is tiny
         should, _ = m.should_exit_with_ml(
-            position=1, z=-1.5, bars_held=28,
-            features=self._features(), model=None,
+            position=1, z=-1.5, bars_held=5,
+            features=self._features(), model=None, half_life=1.0,
         )
         self.assertTrue(should)
+
+    def test_half_life_time_stop_scales(self):
+        # hl=10 → stop at ceil(2.5*10)=25
+        should_early, _ = m.should_exit_with_ml(
+            position=1, z=-1.5, bars_held=24,
+            features=self._features(), model=None, half_life=10.0,
+        )
+        should_late, _ = m.should_exit_with_ml(
+            position=1, z=-1.5, bars_held=25,
+            features=self._features(), model=None, half_life=10.0,
+        )
+        self.assertFalse(should_early)
+        self.assertTrue(should_late)
 
     def test_ml_force_exit(self):
         model = m.LogisticExitModel()
@@ -244,11 +258,11 @@ class TestShouldExitWithML(unittest.TestCase):
         model.bias = 3.0  # sigmoid(3) ≈ 0.95
         should, proba = m.should_exit_with_ml(
             position=1, z=-1.5, bars_held=3,
-            features=self._features(), model=model, ml_threshold=0.62,
+            features=self._features(), model=model, ml_threshold=0.68,
         )
         self.assertTrue(should)
         self.assertIsNotNone(proba)
-        self.assertGreaterEqual(proba, 0.62)
+        self.assertGreaterEqual(proba, 0.68)
 
     def test_ml_suppresses_soft_rule_exit(self):
         model = m.LogisticExitModel()
@@ -256,7 +270,8 @@ class TestShouldExitWithML(unittest.TestCase):
         model.bias = -3.0  # sigmoid(-3) ≈ 0.05
         should, proba = m.should_exit_with_ml(
             position=1, z=-0.2, bars_held=5,  # would be soft rule exit
-            features=self._features(), model=model, ml_threshold=0.62,
+            features=self._features(), model=model, ml_threshold=0.68,
+            half_life=20.0,  # time-stop at 50 — soft exit can be suppressed
         )
         self.assertFalse(should)
         self.assertLess(proba, 0.38)
