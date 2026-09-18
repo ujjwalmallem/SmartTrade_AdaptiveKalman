@@ -1,0 +1,33 @@
+{
+  "trained_at": "2026-09-18T14:42:12.912216+00:00",
+  "feature_names": [
+    "vol",
+    "pnl_proxy",
+    "abs_entry_z",
+    "confidence",
+    "exit_z",
+    "velocity",
+    "bars_held",
+    "half_life"
+  ],
+  "schema_version": 3,
+  "penalty": "l2",
+  "C": 1.0,
+  "calibrated": true,
+  "min_samples_required": 50,
+  "probability_threshold": 0.68,
+  "metrics": {
+    "n_samples": 62,
+    "n_train": 46,
+    "n_test": 16,
+    "class_balance": {
+      "label_0": 7,
+      "label_1": 55,
+      "positive_rate": 0.8870967741935484
+    },
+    "accuracy": 0.875,
+    "roc_auc": 1.0
+  },
+  "model_path": "models/logistic_exit_model.pkl",
+  "scaler_path": "models/feature_scaler.pkl"
+}
