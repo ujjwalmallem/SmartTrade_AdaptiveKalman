@@ -18,7 +18,7 @@ python paper_trading_ml_exit.py --train-only
 PYTHONPATH=. python -m src.train_exit_model --results-dir results
 ```
 
-**Exit stack (see `SYSTEM_SPEC.md`):** Kalman state → engine time-stop / stop-loss → `StatArbExitManager` logistic probability (≥ 0.68). Features live in `src/features.py`; config in `config/strategy_config.yaml`.
+**Exit stack (see `SYSTEM_SPEC.md`):** Kalman state → `StatArbExitManager` (hard time-stop / stop-loss / ML ≥ 0.68 from `config/strategy_config.yaml`). Sklearn artifacts under `models/*.pkl`. Legacy in-file `LogisticExitModel` JSON is deprecated and not used for live exits. Training requires ≥50 labeled rows by default.
 
 **Modes:**
 - `live` — latest-bar Alpaca paper orders only (preferred path for real paper fills)
