@@ -6,8 +6,8 @@ Paper trading + ML exit trainer for **Mag7 / semis / memory / hyperscaler** pair
 
 ```bash
 pip install -r requirements.txt
-python paper_trading_ml_exit.py --mode backtest --broker sim   # replay history → ML journal
-python paper_trading_ml_exit.py --mode live --broker alpaca    # fresh data → latest-bar Alpaca paper orders
+python paper_trading_ml_exit.py --mode live --broker alpaca --save-journal alpaca   # real Alpaca paper journal
+python paper_trading_ml_exit.py --mode backtest --broker sim --save-journal all     # optional local sim history
 python paper_trading_ml_exit.py --mode research                # counterfactual setups → results/setups_*.csv
 python paper_trading_ml_exit.py --mode research --data-window latest_year
 python paper_trading_ml_exit.py --data-source auto             # Alpaca primary, yfinance backup
@@ -17,9 +17,11 @@ python paper_trading_ml_exit.py --train-only
 ```
 
 **Modes:**
-- `backtest` — historical sim fills for the ML journal (`paper_trades.csv`)
-- `live` — latest-bar Alpaca paper orders only
+- `live` — latest-bar Alpaca paper orders only (preferred path for real paper fills)
+- `backtest` — historical replay; use `--save-journal all|sim` if you want simulator rows in the CSV
 - `research` — simulate every valid z-crossing to completion into `results/setups_*.csv` (no broker, does not touch the live journal)
+
+**Journal (`--save-journal`):** default **`alpaca`** — `paper_trades.csv` keeps Alpaca paper fills only (legacy sim rows are stripped on save). Use `all` / `sim` for local experiments, or `none` to skip the journal write.
 
 **Brokerage:** default is a local simulator. With `--broker alpaca`, entry/exit on the **latest bar only** are submitted to the Alpaca **paper** API (never live).
 
@@ -31,11 +33,10 @@ python paper_trading_ml_exit.py --train-only
    - `ALPACA_API_SECRET_KEY`
 3. Live mode is **idempotent**: if QCOM/AVGO (or any pair) is already open on Alpaca, the next run adopts it for exit management and will **not** stack duplicate entries.
 4. Fresh live entries **hold overnight** (no same-bar exit) so Alpaca is not asked to reverse a just-submitted pair (wash-trade). Failed exits leave the journal **OPEN**.
-5. The CSV journal drops wash CLOSED rows (`entry==exit`, `pnl_z≈0`) and dedupes repeated sim **and** alpaca OPEN adopts for the same pair/entry (keeps one live OPEN, or a real CLOSED when present). Year filter for training keeps `entry` in the latest year without requiring `exit` in-year.
+5. The CSV journal drops wash CLOSED rows (`entry==exit`, `pnl_z≈0`) and dedupes repeated OPEN adopts for the same pair/entry (keeps one live OPEN, or a real CLOSED when present). Year filter for training keeps `entry` in the latest year without requiring `exit` in-year.
 
-CI (with GitHub Secrets) runs two steps when Alpaca keys exist:
-   1. `--mode backtest --broker sim` → builds the ML journal from history
-   2. `--mode live --broker alpaca` → places paper orders only if today's latest bar has a signal
+CI (with GitHub Secrets) runs **live Alpaca only**:
+   - `--mode live --broker alpaca --save-journal alpaca` → places paper orders if today's latest bar has a signal; journal is real paper fills only (no sim backtest step)
 
 Do **not** put keys in the repo, `.env` commits, workflow logs, or PR text.
 
