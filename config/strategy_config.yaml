@@ -1,0 +1,19 @@
+strategy:
+  name: "kalman_statarb_pairs"
+  version: "2.1.0"
+
+exit_model:
+  model_path: "models/logistic_exit_model.pkl"
+  scaler_path: "models/feature_scaler.pkl"
+  metadata_path: "models/model_metadata.json"
+  probability_threshold: 0.68
+
+risk_engine:
+  max_half_life_multiplier: 2.5
+  absolute_min_bars: 5          # floor for time-stop (NOT a cap)
+  stop_loss_z: 4.0
+  hard_pnl_stop_dollars: -150.00
+
+execution:
+  broker: "alpaca_paper"  # or alpaca_live
+  order_type: "market"

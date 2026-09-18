@@ -39,7 +39,10 @@ jobs:
         run: python -m py_compile paper_trading_ml_exit.py alpaca_paper_broker.py
 
       - name: Unit tests
-        run: python -m unittest test_paper_trading_ml_exit.py -v
+        run: |
+          export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
+          python -m unittest discover -s tests -v
+          python -m unittest test_paper_trading_ml_exit.py -v
 
       - name: Restore accumulated results from results-data branch
         run: |

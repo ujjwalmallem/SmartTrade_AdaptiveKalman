@@ -25,6 +25,14 @@ from alpaca_paper_broker import (
     fetch_daily_ohlcv as fetch_alpaca_daily_ohlcv,
 )
 
+from src.features import (
+    FEATURE_NAMES as SPEC_FEATURE_NAMES,
+    FEATURE_SCHEMA_VERSION as SPEC_FEATURE_SCHEMA_VERSION,
+    features_from_row as spec_features_from_row,
+)
+from src.exit_manager import StatArbExitManager, TradeState, time_stop_bars
+from src.train_exit_model import train_exit_model as train_sklearn_exit_model
+
 # Default artifact locations (gitignored locally; CI uploads as artifacts)
 RESULTS_DIR = Path("results")
 TRADES_CSV = RESULTS_DIR / "paper_trades.csv"
@@ -32,21 +40,9 @@ DATASET_CSV = RESULTS_DIR / "exit_training_dataset.csv"
 MODEL_JSON = RESULTS_DIR / "logistic_exit_model.json"
 SETUPS_GLOB = "setups_*.csv"
 
-FEATURE_NAMES = [
-    # Direction-symmetric, non-collinear exit features (v2).
-    # Dropped: raw entry_z (asymmetric vs abs), favorable/best_fav (collinear with pnl).
-    "entry_mag",       # |entry_z| — entry depth, same for long/short
-    "pnl_z",           # direction-aware unrealized PnL (sole performance signal)
-    "giveback",        # MFE − current favorable (peak giveback; orthogonal to pnl)
-    "bars_held",       # bars / 30
-    "confidence",
-    "edge_velocity",   # direction × spread_velocity (profit-direction momentum)
-    "z_abs",           # |current z| — distance from mean
-    "vol",
-    "half_life",       # OU half-life / 30
-    "hold_vs_hl",      # bars_held / half_life — duration vs mean-reversion scale
-]
-FEATURE_SCHEMA_VERSION = 2
+# SYSTEM_SPEC §2 — 8-feature symmetric set (source of truth: src/features.py)
+FEATURE_NAMES = list(SPEC_FEATURE_NAMES)
+FEATURE_SCHEMA_VERSION = int(SPEC_FEATURE_SCHEMA_VERSION)
 
 # ============================================================
 # PASTE ALL PREVIOUS CLASSES HERE (or keep them in the same file)
@@ -793,41 +789,20 @@ def extract_exit_features(
     half_life: float = 20.0,
 ) -> np.ndarray:
     """
-    Build the exit feature vector used by LogisticExitModel.
+    SYSTEM_SPEC §2 feature vector (delegates to src.features).
 
-    Direction-symmetric (long/short share the same geometry) and avoids
-    collinear PnL duplicates (favorable / best_fav removed).
-    Order matches FEATURE_NAMES.
+    Also tracks highest_favorable_z on the position for journal diagnostics
+    (not fed to the classifier — favorable/best_fav are dropped).
     """
     z = float(row["zscore"])
-    conf = float(row.get("confidence", 0.5))
-    vel = float(row.get("spread_velocity", 0.0))
-    vol = float(row.get("spread_vol", 1.0))
-
     if direction == 1:
-        pnl_z = z - position.entry_z
-        favorable = max(0.0, pnl_z)
+        favorable = max(0.0, z - position.entry_z)
     else:
-        pnl_z = position.entry_z - z
-        favorable = max(0.0, pnl_z)
-
+        favorable = max(0.0, position.entry_z - z)
     position.highest_favorable_z = max(position.highest_favorable_z, favorable)
-    giveback = max(0.0, float(position.highest_favorable_z) - favorable)
-    hl = float(half_life)
-    hold_vs_hl = bars_held / max(hl, 1.0)
-
-    return np.array([
-        abs(position.entry_z),          # entry_mag
-        pnl_z,                          # pnl_z
-        giveback,                       # giveback
-        bars_held / 30.0,               # bars_held
-        conf,                           # confidence
-        float(direction) * vel,         # edge_velocity
-        abs(z),                         # z_abs
-        vol,                            # vol
-        hl / 30.0,                      # half_life
-        hold_vs_hl,                     # hold_vs_hl
-    ], dtype=float)
+    return spec_features_from_row(
+        position, row, bars_held, direction, half_life=half_life
+    )
 
 
 def trade_to_features(t: "PaperTrade") -> np.ndarray:
@@ -841,23 +816,24 @@ def trade_to_features(t: "PaperTrade") -> np.ndarray:
         if len(vec) == len(FEATURE_NAMES):
             return vec
 
+    from src.features import extract_feature_vector
+
     pnl = float(t.pnl_z) if t.pnl_z is not None else 0.0
     exit_z = float(t.exit_z) if t.exit_z is not None else 0.0
     bars = int(t.bars_held or 0)
-    hl = 20.0
-    # Without path history, giveback is unknown → 0 (at-peak assumption)
-    return np.array([
-        abs(float(t.entry_z)),
-        pnl,
-        0.0,
-        bars / 30.0,
-        0.70,
-        0.0,
-        abs(exit_z),
-        1.0,
-        hl / 30.0,
-        bars / hl,
-    ], dtype=float)
+    direction = 1 if str(getattr(t, "direction", "")).upper().startswith("LONG") else -1
+    # Reconstruct entry_z from pnl + exit when possible
+    entry_z = float(t.entry_z)
+    return extract_feature_vector(
+        entry_z=entry_z,
+        current_z=exit_z,
+        direction=direction,
+        vol=1.0,
+        confidence=0.70,
+        velocity=0.0,
+        bars_held=bars,
+        half_life=20.0,
+    )
 
 
 def trade_to_label(t: PaperTrade, good_pnl_threshold: float = 0.35) -> int:
@@ -1010,12 +986,14 @@ def _simulate_setups_for_pair(
             )
             half_life = estimate_half_life(df["spread"].iloc[: i + 1], lookback=40)
             features = {
-                "entry_mag": abs(z),
-                "confidence": conf,
-                "half_life": float(half_life) / 30.0,
                 "vol": float(row.get("spread_vol", 1.0)),
-                "edge_velocity": float(direction) * float(row.get("spread_velocity", 0.0)),
-                "z_abs": abs(z),
+                "pnl_proxy": 0.0,
+                "abs_entry_z": abs(z),
+                "confidence": conf,
+                "exit_z": z,
+                "velocity": float(row.get("spread_velocity", 0.0)),
+                "bars_held": 0.0,
+                "half_life": float(half_life) / 30.0,
             }
             continue
 
@@ -1530,6 +1508,16 @@ def train_from_stored_results(
     min_samples: int = 2,
 ) -> LogisticExitModel:
     """Fit the exit model on stored live (Alpaca/yfinance) paper trades only."""
+    # Prefer SYSTEM_SPEC sklearn pipeline when enough rows exist
+    try:
+        train_sklearn_exit_model(
+            Path(dataset_path).parent if dataset_path else RESULTS_DIR,
+            min_samples=max(4, min_samples),
+            calibrate=True,
+        )
+    except Exception as exc:
+        print(f"ℹ️  Sklearn exit trainer skipped ({exc}); using in-process logistic")
+
     dataset_path = Path(dataset_path) if dataset_path is not None else DATASET_CSV
     model_path = Path(model_path) if model_path is not None else MODEL_JSON
     X, y, ds = load_training_dataset(dataset_path, require_live=True)
@@ -1815,29 +1803,29 @@ def should_exit_with_ml(
     ml_threshold: float = 0.68,
     force_rules: bool = True,
     half_life: float = 20.0,
+    exit_manager: Optional[StatArbExitManager] = None,
+    trade_state: Optional[TradeState] = None,
 ) -> Tuple[bool, Optional[float]]:
     """
     Combine classic mean-reversion / time / stop rules with ML probability.
 
-    Time-stop is engine-level (not ML): force-close at max(5, 2.5 × half_life) bars
-    so stale / non-reverting pairs free capital even when duration features are weak.
-
-    Returns
-    -------
-    (should_exit, ml_proba)
+    Prefer StatArbExitManager (SYSTEM_SPEC) when provided; otherwise fall back
+    to the in-process LogisticExitModel + engine time-stop.
     """
-    # ----- Classic safety rules (always available) -----
+    if exit_manager is not None and trade_state is not None:
+        should, _reason, prob = exit_manager.evaluate_trade(trade_state)
+        return should, float(prob)
+
     rule_exit = False
     if position == 1 and z > -0.35:
         rule_exit = True
     if position == -1 and z < 0.35:
         rule_exit = True
-    # Hard time-stop: 2.5×OU half-life, floored at 5 trading days
-    time_stop_bars = int(max(5, np.ceil(2.5 * float(half_life))))
-    hard_time_stop = bars_held >= time_stop_bars
+    time_stop = time_stop_bars(half_life)
+    hard_time_stop = bars_held >= time_stop
     if hard_time_stop:
         rule_exit = True
-    if position == 1 and z < -3.6:          # adverse stop
+    if position == 1 and z < -3.6:
         rule_exit = True
     if position == -1 and z > 3.6:
         rule_exit = True
@@ -1849,15 +1837,11 @@ def should_exit_with_ml(
         except Exception:
             ml_proba = None
 
-    # ----- ML override / reinforcement -----
     if ml_proba is not None:
-        # High probability → force exit even if rules have not triggered yet
         if ml_proba >= ml_threshold:
             return True, ml_proba
-        # Low probability → optionally suppress a soft rule exit
-        # (keep hard stops & half-life time stop)
         if force_rules and ml_proba < 0.38 and not hard_time_stop:
-            if abs(z) < 2.8:          # only suppress mild mean-reversion exits
+            if abs(z) < 2.8:
                 return False, ml_proba
 
     return rule_exit, ml_proba

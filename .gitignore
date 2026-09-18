@@ -5,3 +5,6 @@ __pycache__/
 .env
 .env.*
 !.env.example
+models/*.pkl
+models/*.joblib
+!models/.gitkeep

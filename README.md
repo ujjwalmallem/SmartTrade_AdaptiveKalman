@@ -61,7 +61,8 @@ Historical bars still drive Kalman / ML training in-process; only the most recen
 
 Artifacts land in `results/` (gitignored):
 - `paper_trades.csv` (includes z-PnL, $-PnL after costs, notional)
-- `exit_training_dataset.csv` (smarter exit labels; feature schema v2: `entry_mag`, `pnl_z`, `giveback`, `hold_vs_hl`, …)
+- `exit_training_dataset.csv` (SYSTEM_SPEC 8-feature set + labels)
+- `models/logistic_exit_model.pkl` + `models/feature_scaler.pkl` (sklearn exit path)
 - `logistic_exit_model.json`
 
 ## Scheduler: Cursor Automations (primary)
