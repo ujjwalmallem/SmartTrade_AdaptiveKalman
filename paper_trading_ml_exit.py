@@ -33,10 +33,20 @@ MODEL_JSON = RESULTS_DIR / "logistic_exit_model.json"
 SETUPS_GLOB = "setups_*.csv"
 
 FEATURE_NAMES = [
-    "entry_z", "abs_entry_z", "pnl_proxy", "bars_held", "confidence",
-    "velocity", "exit_z", "favorable", "best_fav", "vol",
-    "half_life",
+    # Direction-symmetric, non-collinear exit features (v2).
+    # Dropped: raw entry_z (asymmetric vs abs), favorable/best_fav (collinear with pnl).
+    "entry_mag",       # |entry_z| — entry depth, same for long/short
+    "pnl_z",           # direction-aware unrealized PnL (sole performance signal)
+    "giveback",        # MFE − current favorable (peak giveback; orthogonal to pnl)
+    "bars_held",       # bars / 30
+    "confidence",
+    "edge_velocity",   # direction × spread_velocity (profit-direction momentum)
+    "z_abs",           # |current z| — distance from mean
+    "vol",
+    "half_life",       # OU half-life / 30
+    "hold_vs_hl",      # bars_held / half_life — duration vs mean-reversion scale
 ]
+FEATURE_SCHEMA_VERSION = 2
 
 # ============================================================
 # PASTE ALL PREVIOUS CLASSES HERE (or keep them in the same file)
@@ -668,33 +678,48 @@ class AdaptiveKalmanPairs:
 
 
 class LogisticExitModel:
-    """Minimal L2 logistic regression for exit decisions."""
+    """L2 logistic regression for exit decisions (z-scored features)."""
 
     def __init__(self):
         self.weights = None
         self.bias = 0.0
         self.feature_names: List[str] = list(FEATURE_NAMES)
+        self.feat_mean: Optional[np.ndarray] = None
+        self.feat_std: Optional[np.ndarray] = None
+        self.schema_version: int = FEATURE_SCHEMA_VERSION
 
     def _sigmoid(self, z):
         return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
+
+    def _transform(self, X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X, dtype=float)
+        if self.feat_mean is None or self.feat_std is None:
+            return X
+        return (X - self.feat_mean) / self.feat_std
 
     def fit(self, X, y, reg=0.3, lr=0.1, epochs=400):
         X = np.asarray(X, dtype=float)
         y = np.asarray(y, dtype=float)
         n, d = X.shape
+        self.feat_mean = X.mean(axis=0)
+        std = X.std(axis=0)
+        self.feat_std = np.where(std < 1e-8, 1.0, std)
+        Xs = self._transform(X)
         self.weights = np.zeros(d)
         self.bias = 0.0
+        self.schema_version = FEATURE_SCHEMA_VERSION
+        self.feature_names = list(FEATURE_NAMES)
         for _ in range(epochs):
-            logits = X @ self.weights + self.bias
+            logits = Xs @ self.weights + self.bias
             probs = self._sigmoid(logits)
             err = probs - y
-            self.weights -= lr * ((X.T @ err) / n + reg * self.weights)
+            self.weights -= lr * ((Xs.T @ err) / n + reg * self.weights)
             self.bias -= lr * (err.mean())
         return self
 
     def predict_proba(self, X):
         X = np.asarray(X, dtype=float)
-        return self._sigmoid(X @ self.weights + self.bias)
+        return self._sigmoid(self._transform(X) @ self.weights + self.bias)
 
     def save(self, path: Path = MODEL_JSON) -> Path:
         path = Path(path)
@@ -703,6 +728,9 @@ class LogisticExitModel:
             "weights": self.weights.tolist() if self.weights is not None else None,
             "bias": float(self.bias),
             "feature_names": self.feature_names,
+            "feat_mean": self.feat_mean.tolist() if self.feat_mean is not None else None,
+            "feat_std": self.feat_std.tolist() if self.feat_std is not None else None,
+            "schema_version": int(self.schema_version),
         }
         path.write_text(json.dumps(payload, indent=2))
         return path
@@ -714,16 +742,23 @@ class LogisticExitModel:
         model.weights = np.array(payload["weights"], dtype=float) if payload["weights"] else None
         model.bias = float(payload["bias"])
         model.feature_names = list(payload.get("feature_names", FEATURE_NAMES))
+        mean = payload.get("feat_mean")
+        std = payload.get("feat_std")
+        model.feat_mean = np.array(mean, dtype=float) if mean is not None else None
+        model.feat_std = np.array(std, dtype=float) if std is not None else None
+        model.schema_version = int(payload.get("schema_version", 1))
         return model
 
 
 def analyze_feature_importance(model, feature_names):
-    print("\nFeature importance (|weight|):")
+    print("\nFeature importance (standardized |weight|, odds ratio e^w):")
     abs_w = np.abs(model.weights)
     order = np.argsort(-abs_w)
     for i in order:
         name = feature_names[i] if i < len(feature_names) else f"f{i}"
-        print(f"  {name:16s} {model.weights[i]:+.4f}")
+        w = float(model.weights[i])
+        print(f"  {name:16s} w={w:+.4f}  OR={np.exp(w):.4f}")
+    print(f"  {'bias':16s} β0={float(model.bias):+.4f}  P0={1.0/(1.0+np.exp(-float(model.bias))):.1%}")
 
 
 # ============================================================
@@ -758,8 +793,10 @@ def extract_exit_features(
     half_life: float = 20.0,
 ) -> np.ndarray:
     """
-    Build the 11-d feature vector used by LogisticExitModel.
-    Includes OU half-life as a mean-reversion strength signal.
+    Build the exit feature vector used by LogisticExitModel.
+
+    Direction-symmetric (long/short share the same geometry) and avoids
+    collinear PnL duplicates (favorable / best_fav removed).
     Order matches FEATURE_NAMES.
     """
     z = float(row["zscore"])
@@ -768,26 +805,28 @@ def extract_exit_features(
     vol = float(row.get("spread_vol", 1.0))
 
     if direction == 1:
-        pnl_proxy = z - position.entry_z
-        favorable = max(0.0, z - position.entry_z)
+        pnl_z = z - position.entry_z
+        favorable = max(0.0, pnl_z)
     else:
-        pnl_proxy = position.entry_z - z
-        favorable = max(0.0, position.entry_z - z)
+        pnl_z = position.entry_z - z
+        favorable = max(0.0, pnl_z)
 
     position.highest_favorable_z = max(position.highest_favorable_z, favorable)
+    giveback = max(0.0, float(position.highest_favorable_z) - favorable)
+    hl = float(half_life)
+    hold_vs_hl = bars_held / max(hl, 1.0)
 
     return np.array([
-        position.entry_z,
-        abs(position.entry_z),
-        pnl_proxy,
-        bars_held / 30.0,
-        conf,
-        vel,
-        z,
-        favorable,
-        position.highest_favorable_z,
-        vol,
-        float(half_life) / 30.0,
+        abs(position.entry_z),          # entry_mag
+        pnl_z,                          # pnl_z
+        giveback,                       # giveback
+        bars_held / 30.0,               # bars_held
+        conf,                           # confidence
+        float(direction) * vel,         # edge_velocity
+        abs(z),                         # z_abs
+        vol,                            # vol
+        hl / 30.0,                      # half_life
+        hold_vs_hl,                     # hold_vs_hl
     ], dtype=float)
 
 
@@ -795,34 +834,29 @@ def trade_to_features(t: "PaperTrade") -> np.ndarray:
     """
     Prefer the exact live feature vector stored at exit.
     Fall back to a reconstructed approximation only if missing
-    (e.g. legacy journal rows).
+    or if the stored vector is from an older feature schema.
     """
     if t.exit_features is not None:
         vec = np.asarray(t.exit_features, dtype=float).ravel()
         if len(vec) == len(FEATURE_NAMES):
             return vec
-        # Pad legacy 10-d vectors with a neutral half-life feature
-        if len(vec) == len(FEATURE_NAMES) - 1:
-            return np.concatenate([vec, [20.0 / 30.0]])
 
-    pnl = t.pnl_z
-    bars_norm = t.bars_held / 30.0
-    exit_z = t.exit_z if t.exit_z is not None else 0.0
-    fav = max(0.0, pnl)
-    best_fav = max(abs(t.entry_z), fav)
-
+    pnl = float(t.pnl_z) if t.pnl_z is not None else 0.0
+    exit_z = float(t.exit_z) if t.exit_z is not None else 0.0
+    bars = int(t.bars_held or 0)
+    hl = 20.0
+    # Without path history, giveback is unknown → 0 (at-peak assumption)
     return np.array([
-        t.entry_z,
-        abs(t.entry_z),
+        abs(float(t.entry_z)),
         pnl,
-        bars_norm,
+        0.0,
+        bars / 30.0,
         0.70,
         0.0,
-        exit_z,
-        fav,
-        best_fav,
+        abs(exit_z),
         1.0,
-        20.0 / 30.0,
+        hl / 30.0,
+        bars / hl,
     ], dtype=float)
 
 
@@ -920,7 +954,7 @@ def _simulate_setups_for_pair(
     model: Optional[LogisticExitModel],
     run_id: str,
     data_window: str = "multi_year",
-    ml_threshold: float = 0.62,
+    ml_threshold: float = 0.68,
     capital: float = 100_000.0,
     risk_frac: float = 0.08,
     cost_bps: float = 4.0,
@@ -976,12 +1010,12 @@ def _simulate_setups_for_pair(
             )
             half_life = estimate_half_life(df["spread"].iloc[: i + 1], lookback=40)
             features = {
-                "entry_z": z,
-                "abs_entry_z": abs(z),
+                "entry_mag": abs(z),
                 "confidence": conf,
                 "half_life": float(half_life) / 30.0,
                 "vol": float(row.get("spread_vol", 1.0)),
-                "velocity": float(row.get("spread_velocity", 0.0)),
+                "edge_velocity": float(direction) * float(row.get("spread_velocity", 0.0)),
+                "z_abs": abs(z),
             }
             continue
 
@@ -999,6 +1033,7 @@ def _simulate_setups_for_pair(
             features=feat_vec,
             model=model,
             ml_threshold=ml_threshold,
+            half_life=half_life,
         )
         if not should_exit:
             continue
@@ -1050,7 +1085,7 @@ def run_research_setups(
     baskets: Optional[Sequence[str]] = None,
     include_cross: bool = True,
     max_pairs_per_basket: int = 6,
-    ml_threshold: float = 0.62,
+    ml_threshold: float = 0.68,
     noise_model: KalmanNoiseModel | str = KalmanNoiseModel.STANDARD,
     data_source: str = "auto",
     data_window: str = "multi_year",
@@ -1101,7 +1136,11 @@ def run_research_setups(
     if MODEL_JSON.exists():
         try:
             model = LogisticExitModel.load(MODEL_JSON)
-            if model.weights is None or len(model.weights) != len(FEATURE_NAMES):
+            if (
+                model.weights is None
+                or len(model.weights) != len(FEATURE_NAMES)
+                or list(getattr(model, "feature_names", [])) != list(FEATURE_NAMES)
+            ):
                 model = None
             else:
                 print(f"✅ Loaded exit model from {MODEL_JSON}")
@@ -1429,13 +1468,12 @@ def load_training_dataset(
         )
     ds = pd.read_csv(path)
     feat_cols = [f"feat_{n}" for n in FEATURE_NAMES]
-    # Backfill new features (e.g. half_life) for older journals
-    if "feat_half_life" not in ds.columns:
-        ds["feat_half_life"] = 20.0 / 30.0
     missing = [c for c in feat_cols + ["label"] if c not in ds.columns]
     if missing:
-        raise ValueError(f"Dataset missing columns: {missing}")
-
+        raise ValueError(
+            f"Dataset missing columns {missing} (feature schema v{FEATURE_SCHEMA_VERSION}). "
+            "Re-run a paper session to rebuild exit_training_dataset.csv."
+        )
     # Training must use real prices only — drop any legacy synthetic rows.
     if require_live and "data_source" in ds.columns:
         before = len(ds)
@@ -1774,11 +1812,15 @@ def should_exit_with_ml(
     bars_held: int,
     features: np.ndarray,
     model: Optional[LogisticExitModel],
-    ml_threshold: float = 0.62,
+    ml_threshold: float = 0.68,
     force_rules: bool = True,
+    half_life: float = 20.0,
 ) -> Tuple[bool, Optional[float]]:
     """
     Combine classic mean-reversion / time / stop rules with ML probability.
+
+    Time-stop is engine-level (not ML): force-close at max(5, 2.5 × half_life) bars
+    so stale / non-reverting pairs free capital even when duration features are weak.
 
     Returns
     -------
@@ -1790,7 +1832,10 @@ def should_exit_with_ml(
         rule_exit = True
     if position == -1 and z < 0.35:
         rule_exit = True
-    if bars_held >= 28:                     # hard time stop
+    # Hard time-stop: 2.5×OU half-life, floored at 5 trading days
+    time_stop_bars = int(max(5, np.ceil(2.5 * float(half_life))))
+    hard_time_stop = bars_held >= time_stop_bars
+    if hard_time_stop:
         rule_exit = True
     if position == 1 and z < -3.6:          # adverse stop
         rule_exit = True
@@ -1810,8 +1855,8 @@ def should_exit_with_ml(
         if ml_proba >= ml_threshold:
             return True, ml_proba
         # Low probability → optionally suppress a soft rule exit
-        # (keep hard stops & time stop)
-        if force_rules and ml_proba < 0.38 and bars_held < 22:
+        # (keep hard stops & half-life time stop)
+        if force_rules and ml_proba < 0.38 and not hard_time_stop:
             if abs(z) < 2.8:          # only suppress mild mean-reversion exits
                 return False, ml_proba
 
@@ -1826,7 +1871,7 @@ def _trade_pair_session(
     trades_remaining: int,
     trade_year: Optional[int] = None,
     model: Optional[LogisticExitModel] = None,
-    ml_threshold: float = 0.62,
+    ml_threshold: float = 0.68,
     mode: str = "backtest",
     latest_bar: Optional[pd.Timestamp] = None,
 ) -> int:
@@ -2013,6 +2058,7 @@ def _trade_pair_session(
                 features=features,
                 model=model,
                 ml_threshold=ml_threshold,
+                half_life=half_life,
             )
 
             if should_exit:
@@ -2062,7 +2108,7 @@ def run_paper_trading_and_train(
     baskets: Optional[Sequence[str]] = None,
     include_cross: bool = True,
     max_pairs_per_basket: int = 6,
-    ml_threshold: float = 0.62,
+    ml_threshold: float = 0.68,
     noise_model: KalmanNoiseModel | str = KalmanNoiseModel.STANDARD,
     broker: str = "sim",
     alpaca_latest_only: bool = True,
@@ -2132,11 +2178,15 @@ def run_paper_trading_and_train(
     if MODEL_JSON.exists():
         try:
             model = LogisticExitModel.load(MODEL_JSON)
-            if model.weights is None or len(model.weights) != len(FEATURE_NAMES):
+            if (
+                model.weights is None
+                or len(model.weights) != len(FEATURE_NAMES)
+                or list(getattr(model, "feature_names", [])) != list(FEATURE_NAMES)
+            ):
                 print(
-                    f"⚠️ Saved model feature dim mismatch "
+                    f"⚠️ Saved model feature schema mismatch "
                     f"({None if model.weights is None else len(model.weights)} vs "
-                    f"{len(FEATURE_NAMES)}); running rule-only this session"
+                    f"{len(FEATURE_NAMES)} / names differ); running rule-only this session"
                 )
                 model = None
             else:
@@ -2268,8 +2318,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ml-threshold",
         type=float,
-        default=0.62,
-        help="ML exit probability threshold for forced exits (default 0.62)",
+        default=0.68,
+        help="ML exit probability threshold for forced exits (default 0.68)",
     )
     parser.add_argument(
         "--noise-model",

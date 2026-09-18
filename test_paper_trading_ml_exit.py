@@ -91,14 +91,67 @@ class TestExitFeatures(unittest.TestCase):
         })
         feat = m.extract_exit_features(pos, row, bars_held=12, direction=1, half_life=15.0)
         self.assertEqual(feat.shape, (len(m.FEATURE_NAMES),))
-        self.assertEqual(feat[0], -2.0)          # entry_z
-        self.assertEqual(feat[1], 2.0)           # abs_entry_z
-        self.assertAlmostEqual(feat[2], 1.5)     # pnl_proxy = -0.5 - (-2.0)
+        self.assertEqual(list(m.FEATURE_NAMES), [
+            "entry_mag", "pnl_z", "giveback", "bars_held", "confidence",
+            "edge_velocity", "z_abs", "vol", "half_life", "hold_vs_hl",
+        ])
+        self.assertEqual(feat[0], 2.0)           # entry_mag
+        self.assertAlmostEqual(feat[1], 1.5)     # pnl_z = -0.5 - (-2.0)
+        self.assertAlmostEqual(feat[2], 0.0)     # giveback at peak
         self.assertAlmostEqual(feat[3], 12 / 30)
-        self.assertEqual(feat[4], 0.7)          # raw Kalman confidence
-        self.assertEqual(feat[6], -0.5)          # current z
-        self.assertAlmostEqual(feat[10], 15.0 / 30.0)  # half_life
+        self.assertEqual(feat[4], 0.7)           # confidence
+        self.assertAlmostEqual(feat[5], 0.1)     # edge_velocity = +1 * 0.1
+        self.assertEqual(feat[6], 0.5)           # z_abs
+        self.assertEqual(feat[7], 1.5)           # vol
+        self.assertAlmostEqual(feat[8], 15.0 / 30.0)
+        self.assertAlmostEqual(feat[9], 12 / 15.0)
         self.assertGreaterEqual(pos.highest_favorable_z, 1.5)
+
+    def test_long_short_entry_mag_symmetric(self):
+        """entry_mag must be identical for ±entry_z (no long/short cancel)."""
+        row = pd.Series({
+            "zscore": 0.0, "confidence": 0.6, "spread_velocity": -0.2, "spread_vol": 1.0,
+        })
+        long_pos = m.PositionState(direction=1, entry_z=-2.5, entry_bar=0, entry_spread=1.0)
+        short_pos = m.PositionState(direction=-1, entry_z=2.5, entry_bar=0, entry_spread=1.0)
+        f_long = m.extract_exit_features(long_pos, row, 5, 1, half_life=20.0)
+        f_short = m.extract_exit_features(short_pos, row, 5, -1, half_life=20.0)
+        self.assertEqual(f_long[0], f_short[0])  # entry_mag
+        self.assertAlmostEqual(f_long[1], f_short[1])  # pnl_z both +2.5 toward 0
+        self.assertAlmostEqual(f_long[5], -f_short[5])  # edge_velocity flips with direction
+
+    def test_giveback_not_collinear_with_pnl(self):
+        pos = m.PositionState(direction=1, entry_z=-2.0, entry_bar=0, entry_spread=1.0)
+        # Peak favorable at z=0 → pnl=2
+        peak = pd.Series({"zscore": 0.0, "confidence": 0.7, "spread_velocity": 0.0, "spread_vol": 1.0})
+        m.extract_exit_features(pos, peak, 4, 1, half_life=20.0)
+        # Give back to z=-1 → pnl=1, giveback=1
+        now = pd.Series({"zscore": -1.0, "confidence": 0.7, "spread_velocity": 0.0, "spread_vol": 1.0})
+        feat = m.extract_exit_features(pos, now, 8, 1, half_life=20.0)
+        self.assertAlmostEqual(feat[1], 1.0)  # pnl_z
+        self.assertAlmostEqual(feat[2], 1.0)  # giveback after retreat from MFE
+        # Move back to peak — giveback 0 while pnl stays high
+        feat2 = m.extract_exit_features(pos, peak, 9, 1, half_life=20.0)
+        self.assertAlmostEqual(feat2[1], 2.0)
+        self.assertAlmostEqual(feat2[2], 0.0)
+        # pnl and giveback are not locked equal across path states
+        self.assertNotAlmostEqual(feat2[1], feat2[2])
+
+    def test_model_standardizes_and_persists_scaler(self):
+        rng = np.random.default_rng(0)
+        X = rng.normal(size=(40, len(m.FEATURE_NAMES))) * np.linspace(1, 5, len(m.FEATURE_NAMES))
+        y = (X[:, 1] + X[:, 2] > 0).astype(float)
+        model = m.LogisticExitModel().fit(X, y, epochs=50)
+        self.assertIsNotNone(model.feat_mean)
+        self.assertIsNotNone(model.feat_std)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model.json"
+            model.save(path)
+            loaded = m.LogisticExitModel.load(path)
+            np.testing.assert_allclose(loaded.feat_mean, model.feat_mean)
+            np.testing.assert_allclose(
+                loaded.predict_proba(X[:3]), model.predict_proba(X[:3]), rtol=1e-5
+            )
 
     def test_trade_to_features_matches_feature_names(self):
         trade = m.PaperTrade(
@@ -178,11 +231,25 @@ class TestShouldExitWithML(unittest.TestCase):
         self.assertIsNone(proba)
 
     def test_hard_time_stop(self):
+        # Fixed floor: 5 bars when half_life is tiny
         should, _ = m.should_exit_with_ml(
-            position=1, z=-1.5, bars_held=28,
-            features=self._features(), model=None,
+            position=1, z=-1.5, bars_held=5,
+            features=self._features(), model=None, half_life=1.0,
         )
         self.assertTrue(should)
+
+    def test_half_life_time_stop_scales(self):
+        # hl=10 → stop at ceil(2.5*10)=25
+        should_early, _ = m.should_exit_with_ml(
+            position=1, z=-1.5, bars_held=24,
+            features=self._features(), model=None, half_life=10.0,
+        )
+        should_late, _ = m.should_exit_with_ml(
+            position=1, z=-1.5, bars_held=25,
+            features=self._features(), model=None, half_life=10.0,
+        )
+        self.assertFalse(should_early)
+        self.assertTrue(should_late)
 
     def test_ml_force_exit(self):
         model = m.LogisticExitModel()
@@ -191,11 +258,11 @@ class TestShouldExitWithML(unittest.TestCase):
         model.bias = 3.0  # sigmoid(3) ≈ 0.95
         should, proba = m.should_exit_with_ml(
             position=1, z=-1.5, bars_held=3,
-            features=self._features(), model=model, ml_threshold=0.62,
+            features=self._features(), model=model, ml_threshold=0.68,
         )
         self.assertTrue(should)
         self.assertIsNotNone(proba)
-        self.assertGreaterEqual(proba, 0.62)
+        self.assertGreaterEqual(proba, 0.68)
 
     def test_ml_suppresses_soft_rule_exit(self):
         model = m.LogisticExitModel()
@@ -203,7 +270,8 @@ class TestShouldExitWithML(unittest.TestCase):
         model.bias = -3.0  # sigmoid(-3) ≈ 0.05
         should, proba = m.should_exit_with_ml(
             position=1, z=-0.2, bars_held=5,  # would be soft rule exit
-            features=self._features(), model=model, ml_threshold=0.62,
+            features=self._features(), model=model, ml_threshold=0.68,
+            half_life=20.0,  # time-stop at 50 — soft exit can be suppressed
         )
         self.assertFalse(should)
         self.assertLess(proba, 0.38)
@@ -376,6 +444,10 @@ class TestEndToEndYfinance(unittest.TestCase):
             self.assertIsNotNone(model.weights)
             self.assertEqual(len(model.weights), len(m.FEATURE_NAMES))
             self.assertIn("half_life", m.FEATURE_NAMES)
+            self.assertIn("giveback", m.FEATURE_NAMES)
+            self.assertIn("entry_mag", m.FEATURE_NAMES)
+            self.assertNotIn("favorable", m.FEATURE_NAMES)
+            self.assertNotIn("best_fav", m.FEATURE_NAMES)
             self.assertTrue((tmp_path / "logistic_exit_model.json").exists())
             for t in closed:
                 self.assertGreater(t.notional, 0.0)
@@ -383,7 +455,11 @@ class TestEndToEndYfinance(unittest.TestCase):
                 self.assertGreaterEqual(t.cost_dollars, 0.0)
                 self.assertEqual(len(t.exit_features), len(m.FEATURE_NAMES))
             self.assertIn("pnl_dollars", journal.columns)
-            self.assertIn("feat_half_life", pd.read_csv(tmp_path / "exit_training_dataset.csv").columns)
+            ds = pd.read_csv(tmp_path / "exit_training_dataset.csv")
+            self.assertIn("feat_half_life", ds.columns)
+            self.assertIn("feat_giveback", ds.columns)
+            self.assertIn("feat_hold_vs_hl", ds.columns)
+            self.assertNotIn("feat_favorable", ds.columns)
 
 
 
@@ -809,7 +885,9 @@ class TestResearchMode(unittest.TestCase):
             self.assertIsNotNone(s.exit_time)
             self.assertIsNotNone(s.label)
             self.assertEqual(s.exit_model_version, "rules_only")
-            self.assertIn("feat_entry_z", s.to_row())
+            self.assertIn("feat_entry_mag", s.to_row())
+            self.assertNotIn("feat_entry_z", s.to_row())
+            self.assertNotIn("feat_favorable", s.to_row())
 
     def test_latest_year_gate_skips_prior_year(self):
         df = self._synthetic_pair_frame()
@@ -834,7 +912,7 @@ class TestResearchMode(unittest.TestCase):
                 direction=1,
                 entry_time=pd.Timestamp("2026-04-13"),
                 entry_bar=70,
-                features={"entry_z": -2.2, "abs_entry_z": 2.2},
+                features={"entry_mag": 2.2, "z_abs": 2.2},
                 taken=False,
                 exit_time=pd.Timestamp("2026-04-17"),
                 bars_held=4,
