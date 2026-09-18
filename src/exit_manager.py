@@ -16,6 +16,9 @@ import numpy as np
 from src.features import FEATURE_NAMES, load_scaler, transform_features
 from src.config import load_strategy_config, DEFAULT_CONFIG_PATH
 
+# Sentinel: omit model/scaler kwargs to load from disk; pass None to force empty.
+_LOAD_FROM_DISK = object()
+
 
 @dataclass
 class TradeState:
@@ -80,8 +83,8 @@ class StatArbExitManager:
         absolute_min_bars: int = 5,
         stop_loss_z: float = 4.0,
         hard_pnl_stop_dollars: float = -150.0,
-        model: Any = None,
-        scaler: Any = None,
+        model: Any = _LOAD_FROM_DISK,
+        scaler: Any = _LOAD_FROM_DISK,
     ):
         cfg = load_strategy_config(config_path)
         exit_cfg = cfg.get("exit_model") or {}
@@ -111,17 +114,17 @@ class StatArbExitManager:
             "scaler_path", "models/feature_scaler.pkl"
         )
 
-        if model is not None:
-            self.model = model
-        else:
+        if model is _LOAD_FROM_DISK:
             mp = Path(model_path)
             self.model = joblib.load(mp) if mp.exists() else None
-
-        if scaler is not None:
-            self.scaler = scaler
         else:
+            self.model = model
+
+        if scaler is _LOAD_FROM_DISK:
             sp = Path(scaler_path)
             self.scaler = load_scaler(sp) if sp.exists() else None
+        else:
+            self.scaler = scaler
 
     @classmethod
     def from_config(cls, config_path: Union[str, Path] = DEFAULT_CONFIG_PATH) -> "StatArbExitManager":
