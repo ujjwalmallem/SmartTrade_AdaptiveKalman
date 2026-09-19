@@ -23,6 +23,8 @@ _DEFAULTS: Dict[str, Any] = {
         "good_pnl_threshold": 0.35,
         "penalty": "l2",
         "C": 1.0,
+        "class_weight": "balanced",
+        "holdout": "pair",  # random | pair
     },
     "risk_engine": {
         "max_half_life_multiplier": 2.5,

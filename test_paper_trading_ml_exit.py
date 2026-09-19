@@ -446,13 +446,28 @@ class TestEndToEndYfinance(unittest.TestCase):
             m.DATASET_CSV = tmp_path / "exit_training_dataset.csv"
             m.MODEL_JSON = tmp_path / "logistic_exit_model.json"
 
-            trader, exit_mgr, _ = m.run_paper_trading_and_train(
-                n_bars=400,
-                min_trades=2,
-                baskets=["mag7", "semis", "memory", "hyperscaler"],
-                include_cross=True,
-                journal_scope="all",  # this test exercises sim fills; production default is alpaca
-            )
+            # Isolate from any local models/*.pkl so soft-MR / hard stops apply
+            models_dir = Path("models")
+            stashed = []
+            for name in ("logistic_exit_model.pkl", "feature_scaler.pkl"):
+                src = models_dir / name
+                if src.exists():
+                    dst = tmp_path / f"stash_{name}"
+                    src.rename(dst)
+                    stashed.append((src, dst))
+            try:
+                trader, exit_mgr, _ = m.run_paper_trading_and_train(
+                    n_bars=400,
+                    min_trades=2,
+                    baskets=["mag7", "semis", "memory", "hyperscaler"],
+                    include_cross=True,
+                    journal_scope="all",  # this test exercises sim fills; production default is alpaca
+                )
+            finally:
+                for src, dst in stashed:
+                    if dst.exists():
+                        dst.rename(src)
+
             self.assertIsNotNone(trader)
             closed = [t for t in trader.trades if t.status == "CLOSED"]
             self.assertGreaterEqual(len(closed), 2)
@@ -467,6 +482,7 @@ class TestEndToEndYfinance(unittest.TestCase):
             self.assertIsNotNone(exit_mgr)
             self.assertIsInstance(exit_mgr, m.StatArbExitManager)
             self.assertAlmostEqual(exit_mgr.exit_threshold, 0.68)
+            self.assertIsNone(exit_mgr.model)
             self.assertIn("half_life", m.FEATURE_NAMES)
             self.assertIn("abs_entry_z", m.FEATURE_NAMES)
             self.assertIn("pnl_proxy", m.FEATURE_NAMES)

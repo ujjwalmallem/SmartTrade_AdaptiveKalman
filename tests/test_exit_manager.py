@@ -175,10 +175,14 @@ class TestTrainExitModel(unittest.TestCase):
             results.mkdir()
             models = tmp_path / "models"
             models.mkdir()
-            # Balanced synthetic dataset
+            # Balanced synthetic dataset across pairs
             rows = []
-            for i in range(12):
+            pairs = [("AAPL", "MSFT"), ("NVDA", "AMD"), ("MU", "WDC"), ("AMZN", "META")]
+            for i in range(24):
+                a, b = pairs[i % len(pairs)]
                 rows.append({
+                    "ticker_a": a,
+                    "ticker_b": b,
                     "vol": 1.0 + 0.1 * i,
                     "pnl_proxy": 1.5 if i % 2 == 0 else -0.2,
                     "abs_entry_z": 2.2,
@@ -198,6 +202,9 @@ class TestTrainExitModel(unittest.TestCase):
                     f"  scaler_path: '{models / 'feature_scaler.pkl'}'",
                     f"  metadata_path: '{models / 'model_metadata.json'}'",
                     "  probability_threshold: 0.68",
+                    "training:",
+                    "  class_weight: balanced",
+                    "  holdout: pair",
                     "risk_engine:",
                     "  max_half_life_multiplier: 2.5",
                     "  absolute_min_bars: 5",
@@ -211,6 +218,10 @@ class TestTrainExitModel(unittest.TestCase):
             self.assertTrue(Path(meta["model_path"]).exists())
             self.assertTrue(Path(meta["scaler_path"]).exists())
             self.assertEqual(meta["feature_names"], list(FEATURE_NAMES))
+            self.assertEqual(meta["class_weight"], "balanced")
+            self.assertIn(meta["holdout"], ("pair", "random"))
+            self.assertIsNotNone(meta.get("coefficients"))
+            self.assertIn("pnl_proxy", meta["coefficients"])
 
 
 if __name__ == "__main__":

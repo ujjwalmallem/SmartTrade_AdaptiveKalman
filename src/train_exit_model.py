@@ -20,7 +20,7 @@ import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
 from src.features import (
     FEATURE_NAMES,
@@ -33,6 +33,56 @@ from src.config import load_strategy_config, training_min_samples
 
 DEFAULT_CONFIG = Path("config/strategy_config.yaml")
 DEFAULT_RESULTS = Path("results")
+
+
+def _resolve_class_weight(raw: Any) -> Any:
+    if raw is None or raw is False:
+        return None
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in ("", "none", "null", "off", "false"):
+            return None
+        if s == "balanced":
+            return "balanced"
+    return raw
+
+
+def _extract_base_coefficients(model: Any) -> Optional[Dict[str, float]]:
+    """Pull logistic coefficients from a fitted (possibly calibrated) model."""
+    base = model
+    if hasattr(model, "calibrated_classifiers_") and model.calibrated_classifiers_:
+        # Average coefficients across CV folds when available
+        coefs = []
+        intercepts = []
+        for cc in model.calibrated_classifiers_:
+            est = getattr(cc, "estimator", None) or getattr(cc, "base_estimator", None)
+            if est is not None and hasattr(est, "coef_"):
+                coefs.append(np.asarray(est.coef_, dtype=float).ravel())
+                intercepts.append(float(np.asarray(est.intercept_).ravel()[0]))
+        if coefs:
+            mean_coef = np.mean(np.vstack(coefs), axis=0)
+            return {
+                **{FEATURE_NAMES[i]: float(mean_coef[i]) for i in range(len(FEATURE_NAMES))},
+                "bias": float(np.mean(intercepts)),
+            }
+    if hasattr(base, "coef_"):
+        coef = np.asarray(base.coef_, dtype=float).ravel()
+        bias = float(np.asarray(base.intercept_).ravel()[0]) if hasattr(base, "intercept_") else 0.0
+        return {
+            **{FEATURE_NAMES[i]: float(coef[i]) for i in range(min(len(FEATURE_NAMES), len(coef)))},
+            "bias": bias,
+        }
+    return None
+
+
+def _pair_group_labels(df: pd.DataFrame) -> Optional[np.ndarray]:
+    if not {"ticker_a", "ticker_b"}.issubset(df.columns):
+        return None
+    return (
+        df["ticker_a"].astype(str).str.upper()
+        + "/"
+        + df["ticker_b"].astype(str).str.upper()
+    ).to_numpy()
 
 
 def lookahead_horizon(half_life_bars: float, multiplier: float = 2.5) -> int:
@@ -190,6 +240,7 @@ def train_exit_model(
     random_state: int = 42,
     penalty: Optional[str] = None,
     C: Optional[float] = None,
+    class_weight: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Fit StandardScaler + LogisticRegression (+ optional calibration).
@@ -207,6 +258,11 @@ def train_exit_model(
         penalty = str(train_cfg.get("penalty", "l2"))
     if C is None:
         C = float(train_cfg.get("C", 1.0))
+    if class_weight is None:
+        class_weight = _resolve_class_weight(train_cfg.get("class_weight", "balanced"))
+    else:
+        class_weight = _resolve_class_weight(class_weight)
+    holdout = str(train_cfg.get("holdout", "pair")).lower().strip()
     calibrate_floor = int(train_cfg.get("calibrate_min_samples", 8))
 
     model_path = Path(exit_cfg.get("model_path", "models/logistic_exit_model.pkl"))
@@ -222,7 +278,7 @@ def train_exit_model(
         stop_z = float(risk_cfg.get("stop_loss_z", 4.0))
         df["label"] = [label_closed_trade_row(r, stop_loss_z=stop_z) for _, r in df.iterrows()]
 
-    df = df.dropna(subset=FEATURE_NAMES + ["label"])
+    df = df.dropna(subset=FEATURE_NAMES + ["label"]).reset_index(drop=True)
     y = df["label"].astype(int).to_numpy()
     if len(y) < min_samples:
         raise ValueError(f"Need at least {min_samples} labeled rows; found {len(y)}")
@@ -233,18 +289,39 @@ def train_exit_model(
     scaler = fit_scaler(X)
     Xs = scaler.transform(X)
 
-    strat = y if (y.sum() > 1 and (len(y) - y.sum()) > 1) else None
-    X_train, X_test, y_train, y_test = train_test_split(
-        Xs, y, test_size=min(test_size, 0.5), random_state=random_state, stratify=strat
-    )
+    groups = _pair_group_labels(df) if holdout == "pair" else None
+    used_holdout = "random"
+    if groups is not None and len(np.unique(groups)) >= 4:
+        gss = GroupShuffleSplit(
+            n_splits=1,
+            test_size=min(test_size, 0.5),
+            random_state=random_state,
+        )
+        train_idx, test_idx = next(gss.split(Xs, y, groups))
+        X_train, X_test = Xs[train_idx], Xs[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        used_holdout = "pair"
+        # Fall back if a split lost a class
+        if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
+            used_holdout = "random"
 
-    base = LogisticRegression(
-        penalty=penalty if penalty in ("l1", "l2") else "l2",
-        C=float(C),
-        solver="saga" if penalty == "l1" else "lbfgs",
-        max_iter=2000,
-        random_state=random_state,
-    )
+    if used_holdout == "random":
+        strat = y if (y.sum() > 1 and (len(y) - y.sum()) > 1) else None
+        X_train, X_test, y_train, y_test = train_test_split(
+            Xs, y, test_size=min(test_size, 0.5), random_state=random_state, stratify=strat
+        )
+
+    lr_kwargs: Dict[str, Any] = {
+        "C": float(C),
+        "solver": "saga" if penalty == "l1" else "lbfgs",
+        "max_iter": 2000,
+        "random_state": random_state,
+        "class_weight": class_weight,
+    }
+    # sklearn ≥1.8 deprecates explicit penalty= for plain l2; keep for l1
+    if penalty == "l1":
+        lr_kwargs["penalty"] = "l1"
+    base = LogisticRegression(**lr_kwargs)
     base.fit(X_train, y_train)
 
     if calibrate and len(X_train) >= calibrate_floor:
@@ -271,6 +348,8 @@ def train_exit_model(
     except ValueError:
         metrics["roc_auc"] = None
 
+    coefficients = _extract_base_coefficients(model) or _extract_base_coefficients(base)
+
     model_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, model_path)
     save_scaler(scaler, scaler_path)
@@ -281,10 +360,13 @@ def train_exit_model(
         "schema_version": FEATURE_SCHEMA_VERSION,
         "penalty": penalty,
         "C": C,
+        "class_weight": class_weight if class_weight is not None else "none",
+        "holdout": used_holdout,
         "calibrated": bool(calibrate and len(X_train) >= calibrate_floor),
         "min_samples_required": int(min_samples),
         "probability_threshold": float(exit_cfg.get("probability_threshold", 0.68)),
         "metrics": metrics,
+        "coefficients": coefficients,
         "model_path": str(model_path),
         "scaler_path": str(scaler_path),
     }
@@ -292,8 +374,19 @@ def train_exit_model(
     print(f"✅ Exit model → {model_path}")
     print(f"✅ Scaler     → {scaler_path}")
     print(f"✅ Metadata   → {meta_path}")
-    print(f"   samples={metrics['n_samples']}  acc={metrics['accuracy']:.3f}  "
-          f"auc={metrics['roc_auc']}")
+    print(
+        f"   samples={metrics['n_samples']}  acc={metrics['accuracy']:.3f}  "
+        f"auc={metrics['roc_auc']}  class_weight={class_weight}  holdout={used_holdout}"
+    )
+    if coefficients:
+        # Rank by |weight|
+        ranked = sorted(
+            ((k, v) for k, v in coefficients.items() if k != "bias"),
+            key=lambda kv: abs(kv[1]),
+            reverse=True,
+        )
+        top = ", ".join(f"{k}={v:+.3f}" for k, v in ranked[:4])
+        print(f"   top coefs: {top}")
     return meta
 
 
