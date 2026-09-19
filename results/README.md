@@ -2,13 +2,12 @@
 
 This orphan branch stores CI/session artifacts only (not application code).
 
-Reset on 2026-09-15 (post live-idempotent merge):
-- Cleared thin/noisy journal (sim bootstrap + duplicate OPEN QCOM/AVGO adopts)
-- Cleared training rows (only 5 labels, nearly all `1`) and removed the exit model
-- Schema headers retained so CI appends keep working
+Contents:
+- `paper_trades.csv` — Alpaca live journal (grows slowly; one bar/day)
+- `exit_training_dataset.csv` — path-label harvest for ML training
+- `model_metadata.json` — last train metrics / coefficients
+- `logistic_exit_model.pkl` / `feature_scaler.pkl` — sklearn weights restored into `models/` before live
+
+Path harvest (`alpaca_live_path_harvest`) is the training SSOT until the live journal has enough closed fills.
 
 Alpaca paper account is the source of truth for open positions.
-Next successful closed live fills (`broker=alpaca_paper`) will rebuild the ML journal.
-
-Sources: prefer `alpaca_live` (yfinance backup is fine).
-Trade windows: latest calendar year only.
