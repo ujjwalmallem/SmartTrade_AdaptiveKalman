@@ -96,6 +96,7 @@ For each historical execution log bar $t$ during an active trade:
   * `models/logistic_exit_model.pkl` — trained weights & bias
   * `models/feature_scaler.pkl` — fitted `StandardScaler`
   * `models/model_metadata.json` — training date, metrics, feature order
+  * CI also mirrors `*.pkl` + metadata onto the `results-data` orphan branch so the next live run can restore sklearn weights before retrain
 
 ## 4. Production Exit Manager (`src/exit_manager.py`)
 

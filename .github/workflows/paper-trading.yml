@@ -46,14 +46,29 @@ jobs:
 
       - name: Restore accumulated results from results-data branch
         run: |
-          mkdir -p results
+          mkdir -p results models
           git fetch --depth=1 origin results-data 2>/dev/null || echo "No results-data branch yet (first run)"
           if git rev-parse --verify origin/results-data >/dev/null 2>&1; then
-            for f in results/paper_trades.csv results/exit_training_dataset.csv; do
+            for f in \
+              results/paper_trades.csv \
+              results/exit_training_dataset.csv \
+              results/model_metadata.json
+            do
               if git cat-file -e "origin/results-data:$f" 2>/dev/null; then
                 git show "origin/results-data:$f" > "$f"
               fi
             done
+            # Sklearn weights live under models/ at runtime (gitignored on main).
+            # Persist them on results-data so live can load ML exits before retrain.
+            for f in logistic_exit_model.pkl feature_scaler.pkl; do
+              if git cat-file -e "origin/results-data:results/$f" 2>/dev/null; then
+                git show "origin/results-data:results/$f" > "models/$f"
+                echo "Restored models/$f from results-data"
+              fi
+            done
+            if [ -f results/model_metadata.json ]; then
+              cp -f results/model_metadata.json models/model_metadata.json
+            fi
             echo "Restored prior results (if present)."
           fi
 
@@ -102,7 +117,24 @@ jobs:
       - name: Retrain from stored results
         # Soft: harvest may still be thin on a bad data day
         continue-on-error: true
-        run: python paper_trading_ml_exit.py --train-only
+        run: |
+          set -euo pipefail
+          python paper_trading_ml_exit.py --train-only
+          # Mirror train artifacts into results/ so results-data stays the SSOT
+          # for both the dataset and the sklearn weights used by live.
+          mkdir -p results
+          if [ -f models/model_metadata.json ]; then
+            cp -f models/model_metadata.json results/model_metadata.json
+          fi
+          for f in logistic_exit_model.pkl feature_scaler.pkl; do
+            if [ -f "models/$f" ]; then
+              cp -f "models/$f" "results/$f"
+            fi
+          done
+          if [ -f results/model_metadata.json ]; then
+            echo "--- Retrain summary ---"
+            python -c "import json; m=json.load(open('results/model_metadata.json')); met=m.get('metrics') or {}; bal=met.get('class_balance') or {}; print(f\"n_samples={met.get('n_samples')}  pos_rate={bal.get('positive_rate')}  auc={met.get('roc_auc')}  class_weight={m.get('class_weight')}  holdout={m.get('holdout')}\")"
+          fi
 
       - name: Upload results artifacts
         uses: actions/upload-artifact@v4
@@ -112,6 +144,9 @@ jobs:
           path: |
             results/paper_trades.csv
             results/exit_training_dataset.csv
+            results/model_metadata.json
+            results/logistic_exit_model.pkl
+            results/feature_scaler.pkl
             results/logistic_exit_model.json
           if-no-files-found: warn
 
@@ -127,7 +162,7 @@ jobs:
           # (results/ is gitignored on this branch, so it must be cleared
           # before checkout or it collides with results-data's tracked copy).
           mkdir -p /tmp/results-out
-          cp -f results/*.csv results/*.json /tmp/results-out/ 2>/dev/null || true
+          cp -f results/*.csv results/*.json results/*.pkl /tmp/results-out/ 2>/dev/null || true
           rm -rf results
 
           for attempt in 1 2 3 4 5; do
