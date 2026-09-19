@@ -215,5 +215,6 @@ Prompt Cursor with:
 | Soft MR bands from `risk_engine.soft_mr_*` | Done — on manager; used when weights missing |
 | AR(1) half-life estimator (`src/half_life.py`) | Done — lookback=80, floor 4 bars (was collapsing to 2) |
 | Path-label harvest (`src/harvest.py`, `--harvest-training`) | Done — per-bar `label_path_bars` → dataset |
+| Training `class_weight=balanced` + pair holdout + coef metadata | Done — `src/train_exit_model.py` / YAML |
 | Further monolith split (`PositionState`, broker loop) | Deferred |
 

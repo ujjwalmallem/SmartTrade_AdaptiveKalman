@@ -22,6 +22,25 @@ class TestHalfLifeModule(unittest.TestCase):
         self.assertGreaterEqual(hl, 4.0)
         self.assertLessEqual(hl, 60.0)
 
+    def test_short_series_returns_default(self):
+        hl = estimate_half_life(pd.Series([1.0, 2.0, 1.5]), lookback=80, default_hl=20.0)
+        self.assertEqual(hl, 20.0)
+
+    def test_explosive_phi_returns_max(self):
+        # Explicitly explosive AR(1) φ>1 → no stationary MR → max_hl
+        rng = np.random.default_rng(1)
+        n = 200
+        x = np.zeros(n)
+        x[0] = 0.1
+        for i in range(1, n):
+            x[i] = 1.08 * x[i - 1] + rng.normal(0, 0.05)
+        hl = estimate_half_life(pd.Series(x), lookback=80, max_hl=60.0)
+        self.assertEqual(hl, 60.0)
+
+    def test_constant_series_returns_default(self):
+        hl = estimate_half_life(pd.Series(np.ones(100)), lookback=80, default_hl=20.0)
+        self.assertEqual(hl, 20.0)
+
 
 class TestPathHarvest(unittest.TestCase):
     def _mr_pair_frame(self, n: int = 180) -> pd.DataFrame:

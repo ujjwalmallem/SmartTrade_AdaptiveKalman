@@ -96,6 +96,8 @@ jobs:
             --harvest-training \
             --data-source auto \
             --n-bars 700
+          echo "--- Harvest verification checklist ---"
+          python scripts/verify_harvest.py --dataset results/exit_training_dataset.csv
 
       - name: Retrain from stored results
         # Soft: harvest may still be thin on a bad data day
