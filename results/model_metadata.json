@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-09-19T04:51:06.290329+00:00",
+  "trained_at": "2026-09-19T04:52:27.196374+00:00",
   "feature_names": [
     "vol",
     "pnl_proxy",
@@ -35,11 +35,11 @@
     "pnl_proxy": -0.8806541754837848,
     "abs_entry_z": 0.5494207559351617,
     "confidence": 0.302160409157153,
-    "exit_z": -0.01842745402658383,
-    "velocity": -0.03456139759357065,
+    "exit_z": -0.0184274540265838,
+    "velocity": -0.03456139759357069,
     "bars_held": -0.686358017108688,
     "half_life": 1.2841625799393943,
-    "bias": 0.4058385876310735
+    "bias": 0.40583858763107356
   },
   "model_path": "models/logistic_exit_model.pkl",
   "scaler_path": "models/feature_scaler.pkl"
