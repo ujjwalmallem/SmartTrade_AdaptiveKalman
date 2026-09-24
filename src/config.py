@@ -34,7 +34,7 @@ _DEFAULTS: Dict[str, Any] = {
         "soft_mr_long_z": -0.35,
         "soft_mr_short_z": 0.35,
     },
-    "entry": {"z_entry": 2.0, "min_confidence": 0.55},
+    "entry": {"z_entry": 1.75, "min_confidence": 0.45},
     "execution": {
         "broker": "alpaca_paper",
         "order_type": "market",
@@ -77,12 +77,12 @@ def training_min_samples(cfg: Optional[Dict[str, Any]] = None) -> int:
 
 def entry_z_threshold(cfg: Optional[Dict[str, Any]] = None) -> float:
     cfg = cfg or load_strategy_config()
-    return float((cfg.get("entry") or {}).get("z_entry", 2.0))
+    return float((cfg.get("entry") or {}).get("z_entry", 1.75))
 
 
 def entry_min_confidence(cfg: Optional[Dict[str, Any]] = None) -> float:
     cfg = cfg or load_strategy_config()
-    return float((cfg.get("entry") or {}).get("min_confidence", 0.55))
+    return float((cfg.get("entry") or {}).get("min_confidence", 0.45))
 
 
 def execution_risk_frac(cfg: Optional[Dict[str, Any]] = None) -> float:

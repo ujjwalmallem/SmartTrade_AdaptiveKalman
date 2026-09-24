@@ -30,8 +30,8 @@ class TestConfigSSOT(unittest.TestCase):
             kalman_settings,
         )
         cfg = load_strategy_config()
-        self.assertAlmostEqual(entry_z_threshold(cfg), 2.0)
-        self.assertAlmostEqual(entry_min_confidence(cfg), 0.55)
+        self.assertAlmostEqual(entry_z_threshold(cfg), 1.75)
+        self.assertAlmostEqual(entry_min_confidence(cfg), 0.45)
         self.assertAlmostEqual(execution_risk_frac(cfg), 0.08)
         k = kalman_settings(cfg)
         self.assertAlmostEqual(k["delta"], 1e-4)

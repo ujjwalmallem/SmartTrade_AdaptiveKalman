@@ -1099,6 +1099,67 @@ def prune_journal_to_scope(
     return trades_path
 
 
+def reconcile_open_journal_with_broker(
+    broker: Any,
+    results_dir: Optional[Path] = None,
+    journal_scope: str = "alpaca",
+) -> Path:
+    """
+    Drop journal OPEN rows whose Alpaca pair exposure is flat.
+
+    Live CI can leave a stale OPEN after the paper account flattens (manual
+    close, reject, or adopt never re-synced). Prune alone would keep that
+    orphan forever and make the journal look more active than the broker.
+    """
+    results_dir = Path(results_dir) if results_dir is not None else RESULTS_DIR
+    trades_path = results_dir / "paper_trades.csv"
+    if broker is None or not trades_path.exists():
+        return trades_path
+    scope = (journal_scope or "alpaca").lower().strip()
+    if scope in ("none", "off", "skip"):
+        return trades_path
+
+    journal = pd.read_csv(trades_path)
+    if journal.empty or "status" not in journal.columns:
+        return trades_path
+
+    keep_mask = []
+    dropped = 0
+    for _, row in journal.iterrows():
+        status = str(row.get("status", "")).upper()
+        broker_name = str(row.get("broker", ""))
+        if status != "OPEN" or not broker_name.startswith("alpaca"):
+            keep_mask.append(True)
+            continue
+        ta, tb = str(row.get("ticker_a", "")), str(row.get("ticker_b", ""))
+        try:
+            exp = broker.pair_exposure(ta, tb)
+        except Exception as exc:
+            print(f"⚠️  Reconcile skip {ta}/{tb}: {exc}")
+            keep_mask.append(True)
+            continue
+        if exp.get("flat", True) and not exp.get("blocked"):
+            dropped += 1
+            keep_mask.append(False)
+            print(
+                f"🧹 Dropped stale journal OPEN {ta}/{tb} "
+                f"(Alpaca flat — not adopted this session)"
+            )
+        else:
+            keep_mask.append(True)
+
+    if dropped:
+        journal = journal.loc[keep_mask].reset_index(drop=True)
+        journal = filter_journal_by_scope(journal, scope)
+        journal = dedupe_journal_rows(journal, drop_wash=True)
+        journal.to_csv(trades_path, index=False)
+        print(
+            f"💾 Reconciled journal: removed {dropped} stale OPEN "
+            f"→ {len(journal)} rows → {trades_path}"
+        )
+    return trades_path
+
+
 def _latest_allowed_trade_year(now: Optional[pd.Timestamp] = None) -> int:
     """Calendar year used for training/trade windows (never prior years)."""
     return int(pd.Timestamp(now or pd.Timestamp.now("UTC")).year)
@@ -1720,6 +1781,18 @@ def _trade_pair_session(
                 if position == 0
                 else 0
             )
+            if live and is_latest and position == 0 and direction == 0:
+                # One line per pair so CI logs show *why* no Alpaca fill fired.
+                z_miss = abs(z) < z_thr
+                conf_miss = conf < conf_thr
+                reasons = []
+                if z_miss:
+                    reasons.append(f"|z|={abs(z):.2f}<{z_thr:g}")
+                if conf_miss:
+                    reasons.append(f"conf={conf:.2f}<{conf_thr:g}")
+                if not reasons:
+                    reasons.append("flat")
+                print(f"⏭️  Skip entry {pair.label}: {', '.join(reasons)}")
             if direction != 0:
                 position = direction
                 entry_idx = i
@@ -2046,6 +2119,11 @@ def run_paper_trading_and_train(
             else:
                 # Still strip legacy sim rows so results-data does not stay polluted
                 prune_journal_to_scope(journal_scope=scope)
+            # Drop orphan OPEN rows when the paper account is actually flat
+            if broker_client is not None:
+                reconcile_open_journal_with_broker(
+                    broker_client, journal_scope=scope
+                )
             return trader, exit_manager, df_out
         print("Not enough trades generated. Try increasing n_bars or relaxing entry thresholds.")
         # Still persist when explicitly journaling (e.g. alpaca scope with open rows)

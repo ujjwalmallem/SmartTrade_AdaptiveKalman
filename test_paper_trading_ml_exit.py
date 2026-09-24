@@ -852,6 +852,33 @@ class TestLiveMode(unittest.TestCase):
             self.assertEqual(len(out), 1)
             self.assertTrue(str(out.iloc[0]["broker"]).startswith("alpaca"))
 
+    def test_reconcile_drops_stale_open_when_alpaca_flat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pd.DataFrame([
+                {
+                    "run_id": "a", "trade_id": 1, "ticker_a": "QCOM", "ticker_b": "AVGO",
+                    "direction": "SHORT_SPREAD", "entry_time": "2026-09-15",
+                    "exit_time": None, "broker": "alpaca_paper", "status": "OPEN", "pnl_z": 0.0,
+                },
+            ]).to_csv(tmp_path / "paper_trades.csv", index=False)
+
+            class _FlatBroker:
+                def pair_exposure(self, ticker_a, ticker_b):
+                    return {
+                        "flat": True,
+                        "direction": 0,
+                        "qty_a": 0.0,
+                        "qty_b": 0.0,
+                        "blocked": False,
+                    }
+
+            m.reconcile_open_journal_with_broker(
+                _FlatBroker(), results_dir=tmp_path, journal_scope="alpaca"
+            )
+            out = pd.read_csv(tmp_path / "paper_trades.csv")
+            self.assertEqual(len(out), 0)
+
     def test_replace_training_overwrites_dataset(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
