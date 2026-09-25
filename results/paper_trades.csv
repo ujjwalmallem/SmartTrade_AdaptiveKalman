@@ -1,4 +1,4 @@
 run_id,data_source,trade_id,ticker_a,ticker_b,basket,direction,entry_time,exit_time,entry_z,exit_z,entry_spread,exit_spread,bars_held,pnl_z,ml_proba_at_exit,label,feat_entry_z,feat_abs_entry_z,feat_pnl_proxy,feat_bars_held,feat_confidence,feat_velocity,feat_exit_z,feat_favorable,feat_best_fav,feat_vol,exit_features_json,notional,pnl_dollars,cost_dollars,feat_half_life,broker,qty_a,qty_b,alpaca_order_ids,status
-20260925T133054Z,alpaca_live,1,MU,WDC,memory,SHORT_SPREAD,2026-09-24 04:00:00,,1.5967413695707806,,60.800597378865746,,1,,,,,,,,,,,,,,,0.0,,,,alpaca_paper,3.0,7.0,[],OPEN
-20260925T133054Z,alpaca_live,2,AVGO,META,semis_hyperscaler,LONG_SPREAD,2026-09-24 04:00:00,,-1.0931867476642114,,-20.818275957056926,,1,,,,,,,,,,,,,,,0.0,,,,alpaca_paper,11.0,3.0,[],OPEN
+20260925T133054Z,alpaca_live,1,MU,WDC,memory,SHORT_SPREAD,2026-09-24 04:00:00,,1.5967413695707806,,60.80059737886575,,1,,,,,,,,,,,,,,,0.0,,,,alpaca_paper,3.0,7.0,[],OPEN
+20260925T133054Z,alpaca_live,2,AVGO,META,semis_hyperscaler,LONG_SPREAD,2026-09-24 04:00:00,,-1.0931867476642114,,-20.81827595705693,,1,,,,,,,,,,,,,,,0.0,,,,alpaca_paper,11.0,3.0,[],OPEN
 20260925T133054Z,alpaca_live,3,AMZN,META,hyperscaler,LONG_SPREAD,2026-09-24 04:00:00,,-1.0180425993541538,,-11.331349376618192,,1,,,,,,,,,,,,,,,0.0,,,,alpaca_paper,2.0,3.0,[],OPEN
