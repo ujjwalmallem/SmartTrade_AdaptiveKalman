@@ -565,6 +565,61 @@ class TestLiveMode(unittest.TestCase):
         for tr in trader.trades:
             self.assertEqual(pd.Timestamp(tr.entry_time).normalize(), pd.Timestamp(idx[-1]).normalize())
 
+    def test_live_lookback_enters_on_non_latest_when_flat(self):
+        """Lookback>1 may enter on a recent non-latest bar when Alpaca is flat."""
+        from alpaca_paper_broker import AlpacaPaperBroker
+        from unittest.mock import patch
+
+        br = AlpacaPaperBroker(paper=True, dry_run=True)
+        br.pair_exposure = lambda a, b: {
+            "flat": True, "direction": 0, "qty_a": 0.0, "qty_b": 0.0, "blocked": False,
+        }
+        calls = {"n": 0}
+        real = br.open_pair
+
+        def wrapped(*a, **k):
+            calls["n"] += 1
+            return real(*a, **k)
+
+        br.open_pair = wrapped
+
+        idx = pd.date_range("2026-01-02", periods=80, freq="B")
+        z = np.zeros(len(idx))
+        # Signal on bar -3 (within lookback=5); latest bar is flat / below gate
+        z[-3] = -1.65
+        z[-1] = -0.2
+        df = pd.DataFrame({
+            "zscore": z,
+            "confidence": np.full(len(idx), 0.55),
+            "spread": 0.0,
+            "spread_velocity": 0.0,
+            "spread_vol": 1.0,
+            "price_a": 180.0,
+            "price_b": 340.0,
+        }, index=idx)
+        pair = m.PairSpec(ticker_a="MU", ticker_b="WDC", basket="memory")
+        trader = m.PaperTrader(broker=br, execute_latest_only=True, latest_bar=idx[-1])
+        with patch("paper_trading_ml_exit.live_entry_lookback_bars", return_value=5):
+            m._trade_pair_session(
+                trader, df, pair, min_trades=1, trades_remaining=1,
+                trade_year=2026, mode="live", latest_bar=idx[-1],
+                exit_manager=self._exit_mgr(),
+            )
+        self.assertEqual(len(trader.trades), 1)
+        self.assertEqual(trader.trades[0].status, "OPEN")
+        self.assertEqual(trader.trades[0].broker, "alpaca_paper")
+        self.assertEqual(
+            pd.Timestamp(trader.trades[0].entry_time).normalize(),
+            pd.Timestamp(idx[-3]).normalize(),
+        )
+        self.assertIsNone(trader.trades[0].exit_time)
+        self.assertEqual(calls["n"], 1)
+        self.assertIsNotNone(trader.live_entry_cutoff)
+        self.assertLess(
+            pd.Timestamp(trader.trades[0].entry_time).normalize(),
+            pd.Timestamp(idx[-1]).normalize(),
+        )
+
     def test_live_holds_overnight_no_same_bar_exit(self):
         from alpaca_paper_broker import AlpacaPaperBroker
         br = AlpacaPaperBroker(paper=True, dry_run=True)

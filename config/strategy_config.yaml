@@ -30,11 +30,11 @@ risk_engine:
   soft_mr_short_z: 0.35
 
 entry:
-  # Slightly looser than research-strict gates so daily Alpaca paper
-  # sessions actually place fills. Kalman confidence collapses when vol
-  # rises (exactly when |z| spikes), so 0.55 rejected ~90% of |z|≥2 bars.
-  z_entry: 1.75
-  min_confidence: 0.45
+  # Looser than research-strict gates so daily Alpaca paper sessions
+  # place fills. Kalman confidence collapses when vol rises (exactly
+  # when |z| spikes), so 0.55 rejected ~90% of |z|≥2 bars.
+  z_entry: 1.5
+  min_confidence: 0.40
 
 execution:
   broker: "alpaca_paper"  # or alpaca_live
@@ -42,6 +42,10 @@ execution:
   cost_bps: 4.0
   risk_frac: 0.08
   capital: 100000.0
+  # Live mode: allow entry on any of the last N trade-year bars
+  # (not only the absolute latest). Still overnight-hold on entry;
+  # still blocked by Alpaca pair_exposure / ambiguous legs.
+  live_entry_lookback_bars: 5
 
 kalman:
   delta: 1.0e-4
