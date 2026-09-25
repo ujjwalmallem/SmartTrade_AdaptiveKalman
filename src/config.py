@@ -34,13 +34,14 @@ _DEFAULTS: Dict[str, Any] = {
         "soft_mr_long_z": -0.35,
         "soft_mr_short_z": 0.35,
     },
-    "entry": {"z_entry": 1.75, "min_confidence": 0.45},
+    "entry": {"z_entry": 1.5, "min_confidence": 0.40},
     "execution": {
         "broker": "alpaca_paper",
         "order_type": "market",
         "cost_bps": 4.0,
         "risk_frac": 0.08,
         "capital": 100_000.0,
+        "live_entry_lookback_bars": 5,
     },
     "kalman": {"delta": 1e-4, "R_base": 1e-2, "noise_model": "standard"},
 }
@@ -77,17 +78,23 @@ def training_min_samples(cfg: Optional[Dict[str, Any]] = None) -> int:
 
 def entry_z_threshold(cfg: Optional[Dict[str, Any]] = None) -> float:
     cfg = cfg or load_strategy_config()
-    return float((cfg.get("entry") or {}).get("z_entry", 1.75))
+    return float((cfg.get("entry") or {}).get("z_entry", 1.5))
 
 
 def entry_min_confidence(cfg: Optional[Dict[str, Any]] = None) -> float:
     cfg = cfg or load_strategy_config()
-    return float((cfg.get("entry") or {}).get("min_confidence", 0.45))
+    return float((cfg.get("entry") or {}).get("min_confidence", 0.40))
 
 
 def execution_risk_frac(cfg: Optional[Dict[str, Any]] = None) -> float:
     cfg = cfg or load_strategy_config()
     return float((cfg.get("execution") or {}).get("risk_frac", 0.08))
+
+
+def live_entry_lookback_bars(cfg: Optional[Dict[str, Any]] = None) -> int:
+    """How many recent trade-year bars live mode may enter on (default 5)."""
+    cfg = cfg or load_strategy_config()
+    return max(1, int((cfg.get("execution") or {}).get("live_entry_lookback_bars", 5)))
 
 
 def kalman_settings(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

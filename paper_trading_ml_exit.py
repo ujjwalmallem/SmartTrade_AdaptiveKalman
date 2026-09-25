@@ -38,6 +38,7 @@ from src.config import (
     entry_z_threshold,
     entry_min_confidence,
     execution_risk_frac,
+    live_entry_lookback_bars,
     kalman_settings,
 )
 from src.kalman import AdaptiveKalmanPairs, KalmanNoiseModel
@@ -1334,6 +1335,7 @@ class PaperTrader:
         broker: Optional[AlpacaPaperBroker] = None,
         execute_latest_only: bool = True,
         latest_bar: Optional[pd.Timestamp] = None,
+        live_entry_cutoff: Optional[pd.Timestamp] = None,
     ):
         self.capital = capital
         self.equity = capital
@@ -1342,6 +1344,13 @@ class PaperTrader:
         self.broker = broker
         self.execute_latest_only = bool(execute_latest_only)
         self.latest_bar = pd.Timestamp(latest_bar) if latest_bar is not None else None
+        # Live lookback: route Alpaca for entries on/after this bar (inclusive).
+        # None → latest-bar only (default). Not the same as --alpaca-all-bars.
+        self.live_entry_cutoff = (
+            pd.Timestamp(live_entry_cutoff).normalize()
+            if live_entry_cutoff is not None
+            else None
+        )
         self.trades: List[PaperTrade] = []
         self.current_trade: Optional[PaperTrade] = None
         self.trade_counter = 0
@@ -1360,7 +1369,15 @@ class PaperTrader:
             return True
         if self.latest_bar is None:
             return False
-        return pd.Timestamp(time).normalize() == pd.Timestamp(self.latest_bar).normalize()
+        t = pd.Timestamp(time).normalize()
+        latest = pd.Timestamp(self.latest_bar).normalize()
+        if t == latest:
+            return True
+        # Live lookback window: allow real Alpaca fills for recent signal bars
+        # without enabling all-history --alpaca-all-bars routing.
+        if self.live_entry_cutoff is not None and self.live_entry_cutoff <= t <= latest:
+            return True
+        return False
 
     def open_trade(
         self,
@@ -1686,8 +1703,10 @@ def _trade_pair_session(
 
     mode:
       - backtest: scan the full trade-year window (builds ML journal; sim fills)
-      - live: warm Kalman on history, enter/exit only on the latest bar
-              (this is what places Alpaca paper orders with --broker alpaca)
+      - live: warm Kalman on history, enter on the last N trade-year bars
+              (execution.live_entry_lookback_bars; default 5), exit only on
+              the latest bar (this is what places Alpaca paper orders with
+              --broker alpaca). Fresh entries hold overnight (no same-bar exit).
     """
     if exit_manager is None:
         raise ValueError("exit_manager is required for live/backtest exits")
@@ -1711,6 +1730,27 @@ def _trade_pair_session(
     if trade_year is None:
         trade_year = int(pd.Timestamp(df.index.max()).year)
 
+    lookback_n = live_entry_lookback_bars(cfg) if live else 1
+    # Last N trade-year bars at or before latest (warm-up bars excluded).
+    entry_window: set = set()
+    freshest_entry_i: Optional[int] = None
+    if live:
+        eligible: List[int] = []
+        for j in range(60, len(df)):
+            tj = pd.Timestamp(df.index[j])
+            if int(tj.year) == int(trade_year) and tj.normalize() <= latest_norm:
+                eligible.append(j)
+        if eligible:
+            entry_window = set(eligible[-lookback_n:])
+            freshest_entry_i = max(entry_window)
+            cutoff_i = min(entry_window)
+            trader.live_entry_cutoff = pd.Timestamp(df.index[cutoff_i]).normalize()
+        lookback_best = {"abs_z": 0.0, "conf": 0.0, "time": None}
+    else:
+        lookback_best = {"abs_z": 0.0, "conf": 0.0, "time": None}
+
+    alpaca_checked = False
+
     for i in range(60, len(df)):
         if opened >= trades_remaining:
             break
@@ -1721,18 +1761,24 @@ def _trade_pair_session(
         time = df.index[i]
         in_trade_year = int(pd.Timestamp(time).year) == int(trade_year)
         is_latest = pd.Timestamp(time).normalize() == latest_norm
+        in_live_entry_window = (not live) or (i in entry_window)
+        is_freshest_considered = (
+            live and freshest_entry_i is not None and i == freshest_entry_i
+        )
         fresh_entry_this_bar = False
 
         # ---------- ENTRY ----------
         if position == 0:
             if not in_trade_year:
                 continue
-            # Live mode: ignore historical entry signals; only act on freshest bar
-            if live and not is_latest:
+            # Live mode: only consider the configured lookback window
+            if live and not in_live_entry_window:
                 continue
 
-            # Live idempotency: adopt existing Alpaca pair exposure (exit-only)
-            if live and trader.broker is not None:
+            # Live idempotency: adopt existing Alpaca pair exposure (exit-only).
+            # Check once per pair (not once per lookback bar) to avoid API spam.
+            if live and trader.broker is not None and not alpaca_checked:
+                alpaca_checked = True
                 try:
                     exp = trader.broker.pair_exposure(pair.ticker_a, pair.ticker_b)
                 except Exception as exc:
@@ -1775,13 +1821,21 @@ def _trade_pair_session(
                         f"(qty {exp['qty_a']:.0f}/{exp['qty_b']:.0f}) — will not re-enter"
                     )
 
+            # Track lookback peak for a single skip summary (avoid N lines/pair)
+            if live and position == 0 and abs(z) >= float(lookback_best["abs_z"]):
+                lookback_best = {
+                    "abs_z": abs(z),
+                    "conf": conf,
+                    "time": time,
+                }
+
             # Config-driven z-score entry with confidence filter (only if still flat)
             direction = (
                 entry_direction(z, conf, z_entry=z_thr, min_confidence=conf_thr)
                 if position == 0
                 else 0
             )
-            if live and is_latest and position == 0 and direction == 0:
+            if live and is_freshest_considered and position == 0 and direction == 0:
                 # One line per pair so CI logs show *why* no Alpaca fill fired.
                 z_miss = abs(z) < z_thr
                 conf_miss = conf < conf_thr
@@ -1792,7 +1846,14 @@ def _trade_pair_session(
                     reasons.append(f"conf={conf:.2f}<{conf_thr:g}")
                 if not reasons:
                     reasons.append("flat")
-                print(f"⏭️  Skip entry {pair.label}: {', '.join(reasons)}")
+                extra = ""
+                if lookback_n > 1 and lookback_best["time"] is not None:
+                    bt = pd.Timestamp(lookback_best["time"]).date()
+                    extra = (
+                        f" (lookback={lookback_n} max |z|="
+                        f"{lookback_best['abs_z']:.2f} @ {bt})"
+                    )
+                print(f"⏭️  Skip entry {pair.label}: {', '.join(reasons)}{extra}")
             if direction != 0:
                 position = direction
                 entry_idx = i
@@ -1824,17 +1885,17 @@ def _trade_pair_session(
         # ---------- EXIT (rules + ML + half-life) ----------
         # Use `if` (not elif) so a just-adopted live position can exit this bar
         if position != 0:
-            # Live mode only manages the position on the latest bar
-            if live and not is_latest:
-                continue
-            # Live: never exit on the same bar we just entered (avoids wash trades
-            # and overnight-hold semantics). Adopted exposure may still exit.
+            # Live: never exit on the same bar we just entered (overnight hold).
+            # Apply before the is_latest gate so lookback entries also hold.
             if live and fresh_entry_this_bar:
                 print(
                     f"ℹ️  Live hold overnight on {pair.label} "
                     f"(entered this bar; exit evaluated on next run)"
                 )
                 break
+            # Live mode only manages exits on the latest bar
+            if live and not is_latest:
+                continue
 
             bars_held = i - entry_idx
             pos_state.bars_held = bars_held
@@ -1978,8 +2039,12 @@ def run_paper_trading_and_train(
     print("Starting Paper Trading Session...")
     print(f"Mode: {mode}")
     if mode == "live":
-        print("Live: fresh OHLCV → Kalman warm-up → act only on the latest bar")
-        print("Goal: today's signal only (0 trades is OK if no ±2 z setup)\n")
+        lb = live_entry_lookback_bars()
+        print(
+            f"Live: fresh OHLCV → Kalman warm-up → enter on last {lb} trade-year "
+            f"bar(s); exit only on the latest bar"
+        )
+        print("Goal: recent signal window (0 trades is OK if no setup)\n")
     else:
         print("Backtest: replay history for the ML journal (Alpaca orders only if a fill hits latest bar)")
         print("Goal: Complete at least", min_trades, "round-trip trades\n")
