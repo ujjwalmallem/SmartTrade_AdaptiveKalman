@@ -33,6 +33,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.half_life import estimate_half_life  # noqa: E402
 from src.kalman import AdaptiveKalmanPairs  # noqa: E402
+from src.signals import level_signal as shared_level_signal  # noqa: E402
 
 CAPITAL = 100_000.0
 GROSS_PER_TRADE = 8_000.0          # live: risk_frac 0.08 × $100k, split across legs
@@ -116,21 +117,10 @@ def innov_signal(ca: pd.Series, cb: pd.Series) -> pd.DataFrame:
 
 
 def level_signal(ca: pd.Series, cb: pd.Series, window: int = LEVEL_WINDOW) -> pd.DataFrame:
-    """Classic pairs signal: rolling OLS of log prices, z of the residual."""
-    la, lb = np.log(ca), np.log(cb)
-    mb = lb.rolling(window).mean()
-    ma = la.rolling(window).mean()
-    cov = (la * lb).rolling(window).mean() - ma * mb
-    var = (lb * lb).rolling(window).mean() - mb * mb
-    beta = cov / var
-    alpha = ma - beta * mb
-    resid = la - alpha - beta * lb
-    sd = resid.rolling(window).std()
-    z = resid / sd
-    # log-price beta is a dollar hedge ratio → shares_b/shares_a = beta * pA / pB
-    share_ratio = beta * ca / cb
-    return pd.DataFrame({"zscore": z, "confidence": 1.0, "spread": resid,
-                         "share_ratio": share_ratio}, index=ca.index)
+    """Classic pairs signal (same implementation live trading uses)."""
+    df = shared_level_signal(ca, cb, window)
+    df["confidence"] = 1.0
+    return df[["zscore", "confidence", "spread", "share_ratio"]]
 
 
 def eg_tstat(la: np.ndarray, lb: np.ndarray) -> Tuple[float, float]:

@@ -164,7 +164,9 @@ def harvest_training_dataset(
     Writes/replaces ``exit_training_dataset.csv`` (feat_* columns + label).
     """
     cfg = cfg or load_strategy_config()
-    entry = cfg.get("entry") or {}
+    # Harvest labels the innovation-signal exit model, so it keeps its own
+    # gates rather than following the live entry threshold.
+    entry = cfg.get("harvest") or cfg.get("entry") or {}
     risk = cfg.get("risk_engine") or {}
     z_thr = float(entry.get("z_entry", entry_z_threshold(cfg)))
     conf_thr = float(entry.get("min_confidence", entry_min_confidence(cfg)))

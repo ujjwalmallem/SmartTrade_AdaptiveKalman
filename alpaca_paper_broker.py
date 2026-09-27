@@ -162,7 +162,15 @@ class AlpacaPaperBroker:
             (ticker_a, qty_a, side_a),
             (ticker_b, qty_b, side_b),
         ):
-            order = self._market_order(symbol, qty, side)
+            try:
+                order = self._market_order(symbol, qty, side)
+            except Exception as exc:
+                if result.fills:
+                    self._unwind_leg(result.fills[0])
+                raise RuntimeError(
+                    f"Alpaca entry {ticker_a}/{ticker_b} failed on {symbol} ({exc}); "
+                    f"{'first leg unwound' if result.fills else 'no legs placed'}"
+                ) from exc
             oid = getattr(order, "id", None) or (order.get("id") if isinstance(order, dict) else "")
             status = getattr(order, "status", None) or (
                 order.get("status") if isinstance(order, dict) else ""
@@ -184,6 +192,22 @@ class AlpacaPaperBroker:
             f"{side_a} {qty_a:.0f} {ticker_a} / {side_b} {qty_b:.0f} {ticker_b}"
         )
         return result
+
+    def _unwind_leg(self, fill: BrokerFill) -> None:
+        """
+        Remove a leg whose partner order failed, so no unhedged exposure is left.
+        open_pair only runs when the pair was flat, so any position now held in
+        this symbol came from this leg: cancel it if still pending, else flatten.
+        """
+        if self.dry_run:
+            return
+        try:
+            self.cancel_open_orders(fill.symbol)
+            if self.position_signed_qty(fill.symbol) != 0.0:
+                self._client.close_position(fill.symbol)
+            print(f"   🏦 Unwound orphan leg {fill.side} {fill.qty:.0f} {fill.symbol}")
+        except Exception as exc:
+            print(f"⚠️  Could not unwind orphan leg {fill.symbol} ({exc}); flatten it manually")
 
     def cancel_open_orders(self, *symbols: str) -> int:
         """Cancel open orders for the given symbols (avoids wash-trade blocks)."""
@@ -301,13 +325,20 @@ class AlpacaPaperBroker:
             return 0.0
         try:
             pos = self._client.get_open_position(symbol)
-            qty = float(getattr(pos, "qty", 0) or 0)
-            side = str(getattr(pos, "side", "")).lower()
-            if side == "short" or qty < 0:
-                return -abs(qty)
-            return abs(qty)
-        except Exception:
-            return 0.0
+        except Exception as exc:
+            # Alpaca answers 404 "position does not exist" when flat. Anything
+            # else (rate limit, auth, network) must not masquerade as flat, or
+            # the duplicate-entry guard in open_pair is silently bypassed.
+            status = getattr(exc, "status_code", None)
+            text = str(exc).lower()
+            if status == 404 or "does not exist" in text or "not found" in text:
+                return 0.0
+            raise
+        qty = float(getattr(pos, "qty", 0) or 0)
+        side = str(getattr(pos, "side", "")).lower()
+        if side == "short" or qty < 0:
+            return -abs(qty)
+        return abs(qty)
 
     def pair_exposure(self, ticker_a: str, ticker_b: str) -> dict:
         """

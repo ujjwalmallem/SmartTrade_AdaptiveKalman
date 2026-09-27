@@ -52,6 +52,7 @@ jobs:
             for f in \
               results/paper_trades.csv \
               results/exit_training_dataset.csv \
+              results/alpaca_equity.csv \
               results/model_metadata.json
             do
               if git cat-file -e "origin/results-data:$f" 2>/dev/null; then

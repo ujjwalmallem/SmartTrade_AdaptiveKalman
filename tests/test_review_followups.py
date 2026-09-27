@@ -30,11 +30,12 @@ class TestConfigSSOT(unittest.TestCase):
             kalman_settings,
         )
         cfg = load_strategy_config()
-        self.assertAlmostEqual(entry_z_threshold(cfg), 1.5)
-        self.assertAlmostEqual(entry_min_confidence(cfg), 0.40)
+        self.assertAlmostEqual(entry_z_threshold(cfg), 3.0)
+        self.assertAlmostEqual(entry_min_confidence(cfg), 0.0)
         self.assertAlmostEqual(execution_risk_frac(cfg), 0.08)
-        from src.config import live_entry_lookback_bars
-        self.assertEqual(live_entry_lookback_bars(cfg), 5)
+        from src.config import live_entry_lookback_bars, signal_settings
+        self.assertEqual(live_entry_lookback_bars(cfg), 1)
+        self.assertEqual(signal_settings(cfg), {"type": "level", "level_window": 120, "exit_z": 0.5})
         k = kalman_settings(cfg)
         self.assertAlmostEqual(k["delta"], 1e-4)
         self.assertAlmostEqual(k["R_base"], 1e-2)

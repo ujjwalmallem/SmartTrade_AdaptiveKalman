@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -504,7 +505,25 @@ class TestEndToEndYfinance(unittest.TestCase):
 
 
 
-class TestLiveMode(unittest.TestCase):
+def innovation_mechanics_config():
+    """Config the live/research mechanics tests were written against
+    (innovation signal, |z|>=1.5 entries, 5-bar live lookback)."""
+    from src.config import load_strategy_config
+    cfg = load_strategy_config()
+    cfg["signal"] = {"type": "innovation", "level_window": 120, "exit_z": 0.5}
+    cfg["entry"] = {"z_entry": 1.5, "min_confidence": 0.40}
+    cfg["execution"] = {**cfg["execution"], "live_entry_lookback_bars": 5}
+    return cfg
+
+
+class _PinnedMechanicsConfig:
+    def setUp(self):
+        patcher = mock.patch.object(m, "load_strategy_config", innovation_mechanics_config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class TestLiveMode(_PinnedMechanicsConfig, unittest.TestCase):
 
     def _exit_mgr(self):
         return StatArbExitManager(model=None, scaler=None, exit_threshold=0.68)
@@ -1039,7 +1058,7 @@ class TestAlpacaBroker(unittest.TestCase):
         self.assertIsNone(m.build_broker("sim"))
 
 
-class TestResearchMode(unittest.TestCase):
+class TestResearchMode(_PinnedMechanicsConfig, unittest.TestCase):
 
     def _exit_mgr(self):
         return StatArbExitManager(model=None, scaler=None, exit_threshold=0.68)

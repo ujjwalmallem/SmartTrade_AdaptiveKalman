@@ -1,6 +1,6 @@
 strategy:
   name: "kalman_statarb_pairs"
-  version: "2.2.0"
+  version: "3.0.0"
 
 exit_model:
   model_path: "models/logistic_exit_model.pkl"
@@ -29,10 +29,26 @@ risk_engine:
   soft_mr_long_z: -0.35
   soft_mr_short_z: 0.35
 
+# Entry/exit signal. research/backtest_pairs.py (real prices 2020-09 → 2026-09,
+# next-open fills, costs) found the Kalman-innovation signal lost money in
+# every period and universe tested (live-like: -$17.4k on $100k). The level
+# signal below was the most consistent configuration across both universes
+# tested, but its edge is small and unstable — judge it on the Alpaca equity
+# log (results/alpaca_equity.csv), not on backtests.
+signal:
+  type: "level"          # level | innovation
+  level_window: 120      # rolling OLS / z window in bars (60 and 250 did worse)
+  exit_z: 0.5            # take profit once |z| reverts inside this band
+
 entry:
-  # Looser than research-strict gates so daily Alpaca paper sessions
-  # place fills. Kalman confidence collapses when vol rises (exactly
-  # when |z| spikes), so 0.55 rejected ~90% of |z|≥2 bars.
+  # Level signal: enter only on large dislocations. Low thresholds mainly
+  # buy more trades and more costs (live-like 1.5 averaged -$12..-18/trade).
+  z_entry: 3.0
+  min_confidence: 0.0    # confidence gate applies to the innovation signal only
+
+# Gates for the path-label harvest that trains the innovation-signal exit
+# model (exit_model above). Independent of the live entry gate.
+harvest:
   z_entry: 1.5
   min_confidence: 0.40
 
@@ -42,10 +58,10 @@ execution:
   cost_bps: 4.0
   risk_frac: 0.08
   capital: 100000.0
-  # Live mode: allow entry on any of the last N trade-year bars
-  # (not only the absolute latest). Still overnight-hold on entry;
-  # still blocked by Alpaca pair_exposure / ambiguous legs.
-  live_entry_lookback_bars: 5
+  # Enter only on the freshest bar. Entering on a signal from up to N bars
+  # ago trades after the spread may already have reverted; a 3-day delay
+  # lowered backtest P&L in both universes tested.
+  live_entry_lookback_bars: 1
 
 kalman:
   delta: 1.0e-4

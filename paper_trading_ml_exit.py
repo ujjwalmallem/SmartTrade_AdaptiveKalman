@@ -40,9 +40,11 @@ from src.config import (
     execution_risk_frac,
     live_entry_lookback_bars,
     kalman_settings,
+    signal_settings,
 )
 from src.kalman import AdaptiveKalmanPairs, KalmanNoiseModel
 from src.half_life import estimate_half_life
+from src.signals import level_rule_exit, level_signal
 from src.harvest import harvest_training_dataset
 from src.journal import (
     dedupe_journal_rows,
@@ -1100,6 +1102,99 @@ def prune_journal_to_scope(
     return trades_path
 
 
+def load_open_journal(trades_path: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
+    """
+    Alpaca OPEN journal rows grouped by pair label: the pair's true entry
+    (earliest row), its share quantities and entry order ids.
+
+    Repeated OPEN snapshots of one position are collapsed by entry_time before
+    summing quantities; callers must still cap quantities at what Alpaca holds.
+    """
+    path = Path(trades_path) if trades_path is not None else TRADES_CSV
+    if not path.exists():
+        return {}
+    j = pd.read_csv(path)
+    if j.empty or not {"status", "broker", "ticker_a", "ticker_b"}.issubset(j.columns):
+        return {}
+    j = j[(j["status"].astype(str).str.upper() == "OPEN")
+          & j["broker"].astype(str).str.startswith("alpaca")].copy()
+    if j.empty:
+        return {}
+    j["entry_time"] = pd.to_datetime(j["entry_time"], format="mixed", errors="coerce")
+    j = j.dropna(subset=["entry_time"]).drop_duplicates(
+        subset=["ticker_a", "ticker_b", "direction", "entry_time"], keep="last"
+    )
+    out: Dict[str, Dict[str, Any]] = {}
+    for (ta, tb, direction), g in j.sort_values("entry_time").groupby(
+        ["ticker_a", "ticker_b", "direction"], sort=False
+    ):
+        first = g.iloc[0]
+        ids: List[str] = []
+        for raw in g.get("alpaca_order_ids", pd.Series(dtype=object)).dropna():
+            try:
+                ids.extend(json.loads(raw))
+            except (TypeError, ValueError):
+                pass
+        label = f"{ta}/{tb}"
+        if label in out:
+            print(f"⚠️  Journal has OPEN rows in both directions for {label}; keeping the earliest")
+            continue
+        out[label] = {
+            "ticker_a": ta,
+            "ticker_b": tb,
+            "direction": 1 if str(direction).upper() == "LONG_SPREAD" else -1,
+            "entry_time": pd.Timestamp(first["entry_time"]),
+            "entry_z": float(first["entry_z"]) if pd.notna(first.get("entry_z")) else None,
+            "entry_spread": float(first["entry_spread"]) if pd.notna(first.get("entry_spread")) else 0.0,
+            "qty_a": float(pd.to_numeric(g["qty_a"], errors="coerce").fillna(0).sum()),
+            "qty_b": float(pd.to_numeric(g["qty_b"], errors="coerce").fillna(0).sum()),
+            "order_ids": ids,
+        }
+    return out
+
+
+EQUITY_CSV = RESULTS_DIR / "alpaca_equity.csv"
+
+
+def record_account_snapshot(broker: Any, path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    """
+    Append the Alpaca paper account's own numbers to results/alpaca_equity.csv.
+
+    The journal's pnl_dollars is a z-scaled estimate; this is the ground truth
+    for whether the strategy is making paper money.
+    """
+    if broker is None or getattr(broker, "dry_run", False) or getattr(broker, "_client", None) is None:
+        return None
+    path = Path(path) if path is not None else EQUITY_CSV
+    try:
+        acct = broker._client.get_account()
+        positions = list(broker._client.get_all_positions() or [])
+    except Exception as exc:
+        print(f"⚠️  Account snapshot skipped: {exc}")
+        return None
+    num = lambda x: float(x) if x not in (None, "") else float("nan")  # noqa: E731
+    equity, last_equity = num(acct.equity), num(acct.last_equity)
+    snap = {
+        "timestamp_utc": pd.Timestamp.now("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "equity": equity,
+        "last_equity": last_equity,
+        "day_pnl": equity - last_equity,
+        "cash": num(acct.cash),
+        "long_market_value": num(getattr(acct, "long_market_value", None)),
+        "short_market_value": num(getattr(acct, "short_market_value", None)),
+        "open_positions": len(positions),
+        "unrealized_pl": float(sum(num(getattr(pos, "unrealized_pl", 0)) for pos in positions)),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prev = pd.read_csv(path) if path.exists() else pd.DataFrame()
+    pd.concat([prev, pd.DataFrame([snap])], ignore_index=True).to_csv(path, index=False)
+    print(
+        f"💰 Alpaca paper account: equity ${equity:,.2f} | today {snap['day_pnl']:+,.2f} | "
+        f"unrealized {snap['unrealized_pl']:+,.2f} across {len(positions)} positions"
+    )
+    return snap
+
+
 def reconcile_open_journal_with_broker(
     broker: Any,
     results_dir: Optional[Path] = None,
@@ -1354,6 +1449,11 @@ class PaperTrader:
         self.trades: List[PaperTrade] = []
         self.current_trade: Optional[PaperTrade] = None
         self.trade_counter = 0
+        # Alpaca nets positions per symbol, so a ticker may back only one open
+        # pair at a time; otherwise closing one pair can strip another's hedge.
+        self.ticker_owner: Dict[str, str] = {}
+        # Live: journal OPEN rows keyed by pair label (true entry time / z / qty).
+        self.journal_open: Dict[str, Dict[str, Any]] = {}
 
         if self.broker is not None:
             eq = self.broker.get_equity()
@@ -1361,6 +1461,23 @@ class PaperTrader:
                 self.capital = float(eq)
                 self.equity = float(eq)
                 print(f"🏦 Alpaca paper equity synced: ${self.equity:,.2f}")
+
+    def ticker_conflict(self, label: str, *tickers: str) -> Optional[str]:
+        """Label of another open pair already holding one of these tickers."""
+        for t in tickers:
+            owner = self.ticker_owner.get(t)
+            if owner is not None and owner != label:
+                return owner
+        return None
+
+    def claim_tickers(self, label: str, *tickers: str) -> None:
+        for t in tickers:
+            self.ticker_owner[t] = label
+
+    def release_tickers(self, label: str, *tickers: str) -> None:
+        for t in tickers:
+            if self.ticker_owner.get(t) == label:
+                del self.ticker_owner[t]
 
     def _should_route_to_broker(self, time) -> bool:
         if self.broker is None:
@@ -1440,6 +1557,8 @@ class PaperTrader:
 
         self.current_trade = trade
         self.trades.append(trade)
+        if self.broker is not None and ticker_a and ticker_b:
+            self.claim_tickers(f"{ticker_a}/{ticker_b}", ticker_a, ticker_b)
         pair = f"{ticker_a}/{ticker_b}" if ticker_a and ticker_b else "PAIR"
         print(f"\n🟢 OPENED Trade #{trade.trade_id} | {side} | {pair} [{basket}] | broker={trade.broker}")
         print(f"   Time: {time.date()} | z={z:.2f} | spread={spread:.3f} | notional=${notional:,.0f}")
@@ -1526,6 +1645,7 @@ class PaperTrader:
         if ml_proba is not None:
             print(f"   ML Exit Prob at close: {ml_proba:.2%}")
 
+        self.release_tickers(f"{t.ticker_a}/{t.ticker_b}", t.ticker_a, t.ticker_b)
         self.current_trade = None
         return True
 
@@ -1712,6 +1832,9 @@ def _trade_pair_session(
         raise ValueError("exit_manager is required for live/backtest exits")
     cfg = load_strategy_config()
     z_thr = entry_z_threshold(cfg)
+    sig = signal_settings(cfg)
+    level_mode = sig["type"] == "level"
+    risk_cfg = cfg.get("risk_engine") or {}
     conf_thr = entry_min_confidence(cfg)
     risk_frac = execution_risk_frac(cfg)
     position = 0
@@ -1779,22 +1902,52 @@ def _trade_pair_session(
             # Check once per pair (not once per lookback bar) to avoid API spam.
             if live and trader.broker is not None and not alpaca_checked:
                 alpaca_checked = True
+                jrow = trader.journal_open.get(pair.label)
+                owner = trader.ticker_conflict(pair.label, pair.ticker_a, pair.ticker_b)
+                if jrow is None and owner is not None:
+                    # The shares on these tickers belong to another pair; adopting
+                    # or entering here would trade that pair's hedge.
+                    print(f"⏭️  Skip {pair.label}: {owner} holds a leg (one open pair per ticker)")
+                    break
                 try:
                     exp = trader.broker.pair_exposure(pair.ticker_a, pair.ticker_b)
                 except Exception as exc:
-                    print(f"⚠️  Could not read Alpaca exposure for {pair.label}: {exc}")
-                    exp = {"flat": True, "direction": 0, "qty_a": 0.0, "qty_b": 0.0, "blocked": False}
+                    # Fail closed: an unreadable account must never look flat.
+                    print(f"⚠️  Skip {pair.label}: could not read Alpaca exposure ({exc})")
+                    break
                 if exp.get("blocked"):
                     print(f"⚠️  Skip {pair.label}: ambiguous open legs on Alpaca")
                     break
+                if jrow is not None and not exp.get("flat") and exp.get("direction") != jrow["direction"]:
+                    print(f"⚠️  Skip {pair.label}: journal direction disagrees with Alpaca legs")
+                    break
                 if not exp.get("flat") and exp.get("direction") in (1, -1):
                     position = int(exp["direction"])
+                    qty_a, qty_b = float(exp["qty_a"]), float(exp["qty_b"])
+                    adopt_time, adopt_z = time, z
+                    adopt_spread = float(row["spread"])
                     entry_idx = max(60, i - 1)
+                    order_ids: List[str] = []
+                    if jrow is not None:
+                        # True entry from the journal, so bars_held / PnL are real.
+                        # Cap at Alpaca's net per-symbol holding, which may include
+                        # other pairs' shares or duplicate journal snapshots.
+                        adopt_time = jrow["entry_time"]
+                        if jrow["entry_z"] is not None:
+                            adopt_z = jrow["entry_z"]
+                        adopt_spread = jrow["entry_spread"]
+                        pos_i = int(df.index.searchsorted(pd.Timestamp(adopt_time).normalize()))
+                        entry_idx = max(0, min(pos_i, i))
+                        if jrow["qty_a"] > 0:
+                            qty_a = min(qty_a, jrow["qty_a"])
+                        if jrow["qty_b"] > 0:
+                            qty_b = min(qty_b, jrow["qty_b"])
+                        order_ids = list(jrow["order_ids"])
                     pos_state = PositionState(
                         direction=position,
-                        entry_z=z,
+                        entry_z=adopt_z,
                         entry_bar=entry_idx,
-                        entry_spread=float(row["spread"]),
+                        entry_spread=adopt_spread,
                         highest_favorable_z=0.0,
                     )
                     side = "LONG_SPREAD" if position == 1 else "SHORT_SPREAD"
@@ -1802,24 +1955,36 @@ def _trade_pair_session(
                     mirrored = PaperTrade(
                         trade_id=trader.trade_counter,
                         direction=side,
-                        entry_time=time,
-                        entry_z=z,
-                        entry_spread=float(row["spread"]),
+                        entry_time=adopt_time,
+                        entry_z=adopt_z,
+                        entry_spread=adopt_spread,
                         ticker_a=pair.ticker_a,
                         ticker_b=pair.ticker_b,
                         basket=pair.basket,
-                        notional=0.0,
+                        # Untracked exposure has no true entry z, so its z-scaled
+                        # dollar P&L (and dollar stop) would be fabricated.
+                        notional=(
+                            qty_a * float(row["price_a"]) + qty_b * float(row["price_b"])
+                            if jrow is not None else 0.0
+                        ),
                         broker=trader.broker.name,
-                        qty_a=float(exp["qty_a"]),
-                        qty_b=float(exp["qty_b"]),
+                        qty_a=qty_a,
+                        qty_b=qty_b,
                         status="OPEN",
+                        alpaca_order_ids=order_ids,
                     )
                     trader.current_trade = mirrored
                     trader.trades.append(mirrored)
+                    trader.claim_tickers(pair.label, pair.ticker_a, pair.ticker_b)
                     print(
                         f"ℹ️  Adopted open Alpaca {side} on {pair.label} "
-                        f"(qty {exp['qty_a']:.0f}/{exp['qty_b']:.0f}) — will not re-enter"
+                        f"(qty {qty_a:.0f}/{qty_b:.0f}, entry {pd.Timestamp(adopt_time).date()}, "
+                        f"{'journal' if jrow is not None else 'untracked'}) — will not re-enter"
                     )
+                elif owner is not None:
+                    # Journal says open but Alpaca is flat on this pair; the
+                    # remaining shares on its tickers belong to another pair.
+                    break
 
             # Track lookback peak for a single skip summary (avoid N lines/pair)
             if live and position == 0 and abs(z) >= float(lookback_best["abs_z"]):
@@ -1944,18 +2109,37 @@ def _trade_pair_session(
                 pnl_dollars=pnl_dollars,
             )
 
-            should_exit, ml_proba = should_exit_with_ml(
-                position=position,
-                z=z,
-                bars_held=bars_held,
-                features=features,
-                model=model,
-                ml_threshold=ml_threshold,
-                half_life=half_life,
-                force_rules=force_rules,
-                exit_manager=exit_manager,
-                trade_state=trade_state,
-            )
+            if level_mode:
+                # The exit model was trained on innovation-z features, so it
+                # does not apply here; use the rules the backtest validated,
+                # with the time stop fixed from the half-life at entry.
+                entry_hl = estimate_half_life(df["spread"].iloc[:entry_idx].dropna(), lookback=80)
+                max_bars = time_stop_bars(
+                    entry_hl,
+                    multiplier=float(risk_cfg.get("max_half_life_multiplier", 2.5)),
+                    absolute_min_bars=int(risk_cfg.get("absolute_min_bars", 5)),
+                )
+                should_exit, reason = level_rule_exit(
+                    position, z, bars_held, max_bars,
+                    exit_z=sig["exit_z"],
+                    stop_z=float(risk_cfg.get("stop_loss_z", 4.0)),
+                )
+                ml_proba = None
+                if live:
+                    print(f"   {pair.label}: {reason}")
+            else:
+                should_exit, ml_proba = should_exit_with_ml(
+                    position=position,
+                    z=z,
+                    bars_held=bars_held,
+                    features=features,
+                    model=model,
+                    ml_threshold=ml_threshold,
+                    half_life=half_life,
+                    force_rules=force_rules,
+                    exit_manager=exit_manager,
+                    trade_state=trade_state,
+                )
 
             if should_exit:
                 did_close = trader.close_trade(
@@ -1976,6 +2160,19 @@ def _trade_pair_session(
                     break
 
     return opened
+
+
+def apply_level_signal(
+    df: pd.DataFrame, price_a: pd.Series, price_b: pd.Series, window: int
+) -> pd.DataFrame:
+    """Swap the Kalman innovation z for the level-spread z (see src/signals.py)."""
+    lv = level_signal(price_a.reindex(df.index), price_b.reindex(df.index), window)
+    out = df.copy()
+    out["zscore_innovation"] = out["zscore"]
+    out["zscore"] = lv["zscore"].fillna(0.0)   # warm-up bars: no signal
+    out["spread"] = lv["spread"]
+    out["confidence"] = 1.0
+    return out
 
 
 def build_broker(broker: str = "sim", dry_run: bool = False) -> Optional[AlpacaPaperBroker]:
@@ -2108,12 +2305,23 @@ def run_paper_trading_and_train(
         execute_latest_only=alpaca_latest_only,
         latest_bar=latest_bar,
     )
+    signal_cfg = signal_settings()
+    print(f"Signal: {signal_cfg['type']}"
+          + (f" (window={signal_cfg['level_window']}, exit |z|<={signal_cfg['exit_z']})"
+             if signal_cfg["type"] == "level" else ""))
+    if mode == "live" and broker_client is not None:
+        trader.journal_open = load_open_journal()
+        for label, row in trader.journal_open.items():
+            trader.claim_tickers(label, row["ticker_a"], row["ticker_b"])
+        if trader.journal_open:
+            print(f"📒 Journal OPEN pairs: {', '.join(sorted(trader.journal_open))}")
     kf = build_kalman(noise_model=noise_model)
     pair_frames: Dict[str, pd.DataFrame] = {}
     closed_count = 0
 
     for pair in pairs:
-        if closed_count >= min_trades:
+        # min_trades caps backtest collection; a live run must manage every pair.
+        if mode != "live" and closed_count >= min_trades:
             break
         if pair.ticker_a not in prices.columns or pair.ticker_b not in prices.columns:
             continue
@@ -2130,6 +2338,8 @@ def run_paper_trading_and_train(
             high=hi_a,
             low=lo_a,
         )
+        if signal_cfg["type"] == "level":
+            df = apply_level_signal(df, price_a, price_b, signal_cfg["level_window"])
         pair_frames[pair.label] = df
 
         print(f"\n--- Scanning {pair.label} [{pair.basket}] (year={trade_year}, R={noise_model.value}) ---")
@@ -2146,6 +2356,9 @@ def run_paper_trading_and_train(
             force_rules=force_rules,
         )
         closed_count += opened
+
+    if mode == "live":
+        record_account_snapshot(broker_client)
 
     # 4. Show journal (latest-year trades only)
     closed_trades = trader.summary()

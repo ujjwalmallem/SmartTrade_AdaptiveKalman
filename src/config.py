@@ -44,6 +44,8 @@ _DEFAULTS: Dict[str, Any] = {
         "live_entry_lookback_bars": 5,
     },
     "kalman": {"delta": 1e-4, "R_base": 1e-2, "noise_model": "standard"},
+    "signal": {"type": "innovation", "level_window": 120, "exit_z": 0.5},
+    "harvest": {"z_entry": 1.5, "min_confidence": 0.40},
 }
 
 
@@ -105,4 +107,21 @@ def kalman_settings(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "delta": float(k.get("delta", 1e-4)),
         "R_base": float(k.get("R_base", 1e-2)),
         "noise_model": str(k.get("noise_model", "standard")),
+    }
+
+
+def signal_settings(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    type: "innovation" (Kalman innovation z, ML exits) or "level"
+    (rolling log-price spread z with rule exits; see research/backtest_pairs.py).
+    """
+    cfg = cfg or load_strategy_config()
+    s = cfg.get("signal") or {}
+    kind = str(s.get("type", "innovation")).lower().strip()
+    if kind not in ("innovation", "level"):
+        raise ValueError(f"signal.type must be 'innovation' or 'level', got {kind!r}")
+    return {
+        "type": kind,
+        "level_window": int(s.get("level_window", 120)),
+        "exit_z": float(s.get("exit_z", 0.5)),
     }
