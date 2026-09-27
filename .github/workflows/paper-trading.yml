@@ -17,6 +17,11 @@ concurrency:
 permissions:
   contents: write
 
+env:
+  # main-claude keeps its own journal, dataset and models, separate from
+  # main's results-data, so the two strategies never overwrite each other.
+  RESULTS_BRANCH: results-data-claude
+
 jobs:
   run-paper-trading:
     runs-on: ubuntu-latest
@@ -44,27 +49,27 @@ jobs:
           python -m unittest discover -s tests -v
           python -m unittest test_paper_trading_ml_exit.py -v
 
-      - name: Restore accumulated results from results-data branch
+      - name: Restore accumulated results from the results branch
         run: |
           mkdir -p results models
-          git fetch --depth=1 origin results-data 2>/dev/null || echo "No results-data branch yet (first run)"
-          if git rev-parse --verify origin/results-data >/dev/null 2>&1; then
+          git fetch --depth=1 origin "$RESULTS_BRANCH" 2>/dev/null || echo "No $RESULTS_BRANCH branch yet (first run)"
+          if git rev-parse --verify "origin/$RESULTS_BRANCH" >/dev/null 2>&1; then
             for f in \
               results/paper_trades.csv \
               results/exit_training_dataset.csv \
               results/alpaca_equity.csv \
               results/model_metadata.json
             do
-              if git cat-file -e "origin/results-data:$f" 2>/dev/null; then
-                git show "origin/results-data:$f" > "$f"
+              if git cat-file -e "origin/${RESULTS_BRANCH}:$f" 2>/dev/null; then
+                git show "origin/${RESULTS_BRANCH}:$f" > "$f"
               fi
             done
             # Sklearn weights live under models/ at runtime (gitignored on main).
-            # Persist them on results-data so live can load ML exits before retrain.
+            # Persist them on the results branch so live can load ML exits before retrain.
             for f in logistic_exit_model.pkl feature_scaler.pkl; do
-              if git cat-file -e "origin/results-data:results/$f" 2>/dev/null; then
-                git show "origin/results-data:results/$f" > "models/$f"
-                echo "Restored models/$f from results-data"
+              if git cat-file -e "origin/${RESULTS_BRANCH}:results/$f" 2>/dev/null; then
+                git show "origin/${RESULTS_BRANCH}:results/$f" > "models/$f"
+                echo "Restored models/$f from $RESULTS_BRANCH"
               fi
             done
             if [ -f results/model_metadata.json ]; then
@@ -121,7 +126,7 @@ jobs:
         run: |
           set -euo pipefail
           python paper_trading_ml_exit.py --train-only
-          # Mirror train artifacts into results/ so results-data stays the SSOT
+          # Mirror train artifacts into results/ so the results branch stays the SSOT
           # for both the dataset and the sklearn weights used by live.
           mkdir -p results
           if [ -f models/model_metadata.json ]; then
@@ -151,7 +156,7 @@ jobs:
             results/logistic_exit_model.json
           if-no-files-found: warn
 
-      - name: Publish accumulated results to results-data branch
+      - name: Publish accumulated results to the results branch
         # Avoid push+pull_request double-publish races on the same SHA.
         if: always() && github.event_name != 'pull_request'
         run: |
@@ -161,17 +166,17 @@ jobs:
 
           # Preserve the freshly generated files before switching branches
           # (results/ is gitignored on this branch, so it must be cleared
-          # before checkout or it collides with results-data's tracked copy).
+          # before checkout or it collides with the results branch's tracked copy).
           mkdir -p /tmp/results-out
           cp -f results/*.csv results/*.json results/*.pkl /tmp/results-out/ 2>/dev/null || true
           rm -rf results
 
           for attempt in 1 2 3 4 5; do
-            git fetch --depth=1 origin results-data 2>/dev/null || true
-            if git rev-parse --verify origin/results-data >/dev/null 2>&1; then
-              git checkout -B results-data origin/results-data
+            git fetch --depth=1 origin "$RESULTS_BRANCH" 2>/dev/null || true
+            if git rev-parse --verify "origin/$RESULTS_BRANCH" >/dev/null 2>&1; then
+              git checkout -B "$RESULTS_BRANCH" "origin/$RESULTS_BRANCH"
             else
-              git checkout --orphan results-data
+              git checkout --orphan "$RESULTS_BRANCH"
               git rm -rf . >/dev/null 2>&1 || true
             fi
 
@@ -183,12 +188,12 @@ jobs:
               exit 0
             fi
             git commit -m "Update accumulated paper-trading results" || true
-            if git push origin HEAD:results-data; then
-              echo "Published results-data (attempt ${attempt})"
+            if git push origin "HEAD:$RESULTS_BRANCH"; then
+              echo "Published $RESULTS_BRANCH (attempt ${attempt})"
               exit 0
             fi
-            echo "results-data push race (attempt ${attempt}); retrying..."
+            echo "$RESULTS_BRANCH push race (attempt ${attempt}); retrying..."
             sleep $((attempt * 2))
           done
-          echo "Failed to publish results-data after retries"
+          echo "Failed to publish $RESULTS_BRANCH after retries"
           exit 1

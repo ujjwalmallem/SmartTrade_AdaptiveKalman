@@ -1,7 +1,7 @@
 name: Research Backtest
 
 # Offline research only: downloads public prices, simulates, uploads a report.
-# No secrets, no broker access, no writes to results-data.
+# No secrets, no broker access, no writes to any results branch.
 on:
   push:
     branches: ["main-claude", "claude/**"]
