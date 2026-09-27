@@ -53,11 +53,15 @@ class Config:
     min_conf: float
     hedge: str         # "model" (hedge ratio) | "dollar" (equal $ legs, live behaviour)
     coint: bool        # require Engle-Granger cointegration on the prior 250 days
+    window: int = LEVEL_WINDOW   # level-signal lookback
+    delay: int = 1     # fill at open of day t+delay (live 5-bar lookback ≈ delay up to 5)
+    exclusive: bool = False      # at most one open pair per ticker (Alpaca nets per symbol)
 
     @property
     def name(self) -> str:
-        return (f"{self.signal}|in{self.entry_z}|out{self.exit_z}|conf{self.min_conf}"
-                f"|{self.hedge}|coint{'Y' if self.coint else 'N'}")
+        return (f"{self.signal}{self.window if self.signal == 'level' else ''}|in{self.entry_z}"
+                f"|out{self.exit_z}|conf{self.min_conf}|{self.hedge}|coint{'Y' if self.coint else 'N'}"
+                f"|d{self.delay}|{'excl' if self.exclusive else 'shared'}")
 
 
 # --------------------------------------------------------------------------- data
@@ -159,96 +163,125 @@ class Trade:
     reason: str
 
 
-def simulate_pair(pair: str, px_a: pd.DataFrame, px_b: pd.DataFrame, sig: pd.DataFrame,
-                  cfg: Config, coint_cache: Dict[int, bool]) -> Tuple[List[Trade], pd.Series]:
-    idx = sig.index
-    oa, ob = px_a["Open"].reindex(idx).to_numpy(), px_b["Open"].reindex(idx).to_numpy()
-    ca, cb = px_a["Close"].reindex(idx).to_numpy(), px_b["Close"].reindex(idx).to_numpy()
-    z = sig["zscore"].to_numpy()
-    conf = sig["confidence"].to_numpy()
-    ratio = sig["share_ratio"].to_numpy()
-    spread = sig["spread"]
-    la, lb = np.log(ca), np.log(cb)
+class PairBook:
+    """Per-pair arrays on the portfolio calendar plus open-position state."""
 
-    daily = np.zeros(len(idx))
+    def __init__(self, a: str, b: str, prices: Dict[str, pd.DataFrame], sig: pd.DataFrame,
+                 cal: pd.DatetimeIndex):
+        self.a, self.b, self.label = a, b, f"{a}/{b}"
+        r = lambda s: s.reindex(cal).to_numpy(dtype=float)  # noqa: E731
+        self.oa, self.ob = r(prices[a]["Open"]), r(prices[b]["Open"])
+        self.ca, self.cb = r(prices[a]["Close"]), r(prices[b]["Close"])
+        self.z, self.conf = r(sig["zscore"]), r(sig["confidence"])
+        self.ratio = r(sig["share_ratio"])
+        self.spread = sig["spread"].reindex(cal)
+        self.la, self.lb = np.log(self.ca), np.log(self.cb)
+        self.first = int(np.argmax(np.isfinite(self.ca) & np.isfinite(self.cb)))
+        self.coint_cache: Dict[int, bool] = {}
+        self.reset()
+
+    def reset(self) -> None:
+        self.pos = self.sa = self.sb = 0
+        self.entry_i = self.max_bars = 0
+        self.entry_val = self.entry_cost = 0.0
+        self.pending: Optional[Tuple[str, int, int]] = None   # (kind, direction, execute_at)
+        self.reason = ""
+
+    def valid(self, i: int) -> bool:
+        return all(np.isfinite(x[i]) for x in (self.oa, self.ob, self.ca, self.cb))
+
+    def cointegrated(self, i: int) -> bool:
+        ok = self.coint_cache.get(i)
+        if ok is None:
+            lo = i - COINT_WINDOW + 1
+            if lo < self.first:
+                ok = False
+            else:
+                t, b = eg_tstat(self.la[lo: i + 1], self.lb[lo: i + 1])
+                ok = t < COINT_T_CRIT and b > 0
+            self.coint_cache[i] = ok
+        return ok
+
+
+def simulate_portfolio(books: List[PairBook], cfg: Config, cal: pd.DatetimeIndex
+                       ) -> Tuple[List[Trade], pd.Series]:
+    """Day loop over all pairs, in live scan order, so shared tickers interact."""
+    for bk in books:
+        bk.reset()
+    daily = np.zeros(len(cal))
     trades: List[Trade] = []
-    pos = 0
-    sa = sb = 0
-    entry_i = 0
-    max_bars = 0
-    pending: Optional[Tuple[str, int]] = None   # ("open"/"close", direction)
-    reason = ""
-    entry_cost = 0.0
-    entry_val = 0.0
-    warm = max(LEVEL_WINDOW, 60) + 1
+    busy: Dict[str, str] = {}          # ticker -> pair label holding it (exclusive mode)
+    warm = max(cfg.window if cfg.signal == "level" else 60, 60) + 1
 
-    for i in range(warm, len(idx)):
-        # 1) execute yesterday's decision at today's open
-        if pending is not None:
-            kind, d = pending
-            pending = None
-            if kind == "open":
-                r = ratio[i - 1]
-                if cfg.hedge == "dollar":
-                    leg = GROSS_PER_TRADE / 2
-                    qa = max(1, int(leg / oa[i]))
-                    qb = max(1, int(leg / ob[i]))
-                else:
-                    # gross = qa*pA + r*qa*pB
-                    qa = max(1, int(GROSS_PER_TRADE / (oa[i] + r * ob[i])))
-                    qb = max(1, int(round(r * qa)))
-                sa, sb = d * qa, -d * qb
-                entry_val = sa * oa[i] + sb * ob[i]
-                entry_cost = (abs(sa) * oa[i] + abs(sb) * ob[i]) * COST_BPS_PER_SIDE / 1e4
-                daily[i] += sa * (ca[i] - oa[i]) + sb * (cb[i] - ob[i]) - entry_cost
-                pos, entry_i = d, i
-                hl = estimate_half_life(spread.iloc[: i], lookback=80)
-                max_bars = max(5, math.ceil(2.5 * hl))
+    for i in range(1, len(cal)):
+        for bk in books:
+            if not bk.valid(i) or i < bk.first + warm:
                 continue
-            else:  # close
-                exit_cost = (abs(sa) * oa[i] + abs(sb) * ob[i]) * COST_BPS_PER_SIDE / 1e4
-                short_notional = abs(sa) * oa[i] if sa < 0 else abs(sb) * ob[i]
-                borrow = short_notional * BORROW_BPS_PER_YEAR / 1e4 * (i - entry_i) / 252
-                daily[i] += sa * (oa[i] - ca[i - 1]) + sb * (ob[i] - cb[i - 1]) - exit_cost - borrow
-                exit_val = sa * oa[i] + sb * ob[i]
-                trades.append(Trade(pair, pos, idx[entry_i], idx[i], sa, sb,
-                                    exit_val - entry_val - entry_cost - exit_cost - borrow,
-                                    entry_cost + exit_cost + borrow, i - entry_i, reason))
-                pos, sa, sb = 0, 0, 0
-
-        # 2) mark open position
-        if pos != 0:
-            daily[i] += sa * (ca[i] - ca[i - 1]) + sb * (cb[i] - cb[i - 1])
-
-        if i == len(idx) - 1 or not np.isfinite(z[i]):
-            continue
-
-        # 3) decide at today's close
-        if pos != 0:
-            held = i - entry_i
-            if (pos == 1 and z[i] >= -cfg.exit_z) or (pos == -1 and z[i] <= cfg.exit_z):
-                pending, reason = ("close", pos), "revert"
-            elif abs(z[i]) >= STOP_Z:
-                pending, reason = ("close", pos), "stop"
-            elif held >= max_bars:
-                pending, reason = ("close", pos), "time"
-        else:
-            if abs(z[i]) < cfg.entry_z or conf[i] < cfg.min_conf:
-                continue
-            if not np.isfinite(ratio[i]) or ratio[i] <= 0:
-                continue
-            if cfg.coint:
-                ok = coint_cache.get(i)
-                if ok is None:
-                    t, b = eg_tstat(la[i - COINT_WINDOW + 1: i + 1], lb[i - COINT_WINDOW + 1: i + 1]) \
-                        if i >= COINT_WINDOW else (0.0, 0.0)
-                    ok = t < COINT_T_CRIT and b > 0
-                    coint_cache[i] = ok
-                if not ok:
+            # 1) execute scheduled orders at today's open
+            if bk.pending is not None and bk.pending[2] <= i:
+                kind, d, _ = bk.pending
+                bk.pending = None
+                if kind == "open":
+                    r = bk.ratio[i - 1]
+                    if cfg.hedge == "dollar":
+                        qa = max(1, int(GROSS_PER_TRADE / 2 / bk.oa[i]))
+                        qb = max(1, int(GROSS_PER_TRADE / 2 / bk.ob[i]))
+                    else:
+                        qa = max(1, int(GROSS_PER_TRADE / (bk.oa[i] + r * bk.ob[i])))
+                        qb = max(1, int(round(r * qa)))
+                    bk.sa, bk.sb = d * qa, -d * qb
+                    bk.entry_val = bk.sa * bk.oa[i] + bk.sb * bk.ob[i]
+                    bk.entry_cost = (abs(bk.sa) * bk.oa[i] + abs(bk.sb) * bk.ob[i]) * COST_BPS_PER_SIDE / 1e4
+                    daily[i] += bk.sa * (bk.ca[i] - bk.oa[i]) + bk.sb * (bk.cb[i] - bk.ob[i]) - bk.entry_cost
+                    bk.pos, bk.entry_i = d, i
+                    hl = estimate_half_life(bk.spread.iloc[: i].dropna(), lookback=80)
+                    bk.max_bars = max(5, math.ceil(2.5 * hl))
                     continue
-            pending = ("open", 1 if z[i] < 0 else -1)
+                exit_cost = (abs(bk.sa) * bk.oa[i] + abs(bk.sb) * bk.ob[i]) * COST_BPS_PER_SIDE / 1e4
+                short_notional = abs(bk.sa) * bk.oa[i] if bk.sa < 0 else abs(bk.sb) * bk.ob[i]
+                borrow = short_notional * BORROW_BPS_PER_YEAR / 1e4 * (i - bk.entry_i) / 252
+                daily[i] += (bk.sa * (bk.oa[i] - bk.ca[i - 1]) + bk.sb * (bk.ob[i] - bk.cb[i - 1])
+                             - exit_cost - borrow)
+                exit_val = bk.sa * bk.oa[i] + bk.sb * bk.ob[i]
+                trades.append(Trade(bk.label, bk.pos, cal[bk.entry_i], cal[i], bk.sa, bk.sb,
+                                    exit_val - bk.entry_val - bk.entry_cost - exit_cost - borrow,
+                                    bk.entry_cost + exit_cost + borrow, i - bk.entry_i, bk.reason))
+                bk.pos = bk.sa = bk.sb = 0
+                for t in (bk.a, bk.b):
+                    if busy.get(t) == bk.label:
+                        del busy[t]
 
-    return trades, pd.Series(daily, index=idx)
+            # 2) mark open position
+            if bk.pos != 0:
+                daily[i] += bk.sa * (bk.ca[i] - bk.ca[i - 1]) + bk.sb * (bk.cb[i] - bk.cb[i - 1])
+
+            z = bk.z[i]
+            if i == len(cal) - 1 or not np.isfinite(z) or bk.pending is not None:
+                continue
+
+            # 3) decide at today's close
+            if bk.pos != 0:
+                held = i - bk.entry_i
+                if (bk.pos == 1 and z >= -cfg.exit_z) or (bk.pos == -1 and z <= cfg.exit_z):
+                    bk.pending, bk.reason = ("close", bk.pos, i + 1), "revert"
+                elif abs(z) >= STOP_Z:
+                    bk.pending, bk.reason = ("close", bk.pos, i + 1), "stop"
+                elif held >= bk.max_bars:
+                    bk.pending, bk.reason = ("close", bk.pos, i + 1), "time"
+                continue
+            if abs(z) < cfg.entry_z or bk.conf[i] < cfg.min_conf:
+                continue
+            if not np.isfinite(bk.ratio[i]) or bk.ratio[i] <= 0:
+                continue
+            if cfg.exclusive and (bk.a in busy or bk.b in busy):
+                continue
+            if cfg.coint and not bk.cointegrated(i):
+                continue
+            bk.pending = ("open", 1 if z < 0 else -1, i + cfg.delay)
+            if cfg.exclusive:
+                busy[bk.a] = busy[bk.b] = bk.label
+
+    return trades, pd.Series(daily, index=cal)
 
 
 # ------------------------------------------------------------------------ metrics
@@ -270,71 +303,84 @@ def summarize(daily: pd.Series, trades: List[Trade]) -> Dict[str, float]:
     }
 
 
+LIVE_LIKE = Config("innov", 1.5, 0.5, 0.40, "dollar", False, delay=1, exclusive=False)
+
+
+def build_grid() -> List[Config]:
+    grid = [LIVE_LIKE,
+            Config("innov", 1.5, 0.5, 0.40, "dollar", False, delay=3, exclusive=False),
+            Config("innov", 2.5, 0.5, 0.0, "dollar", False, delay=1, exclusive=True)]
+    for w, ez, xz, excl, dl in itertools.product([60, 120, 250], [2.0, 2.5, 3.0], [0.0, 0.5],
+                                                 [False, True], [1, 3]):
+        grid.append(Config("level", ez, xz, 0.0, "dollar", False, window=w, delay=dl, exclusive=excl))
+    return grid
+
+
 def run(prices: Dict[str, pd.DataFrame], pairs: List[Tuple[str, str]], out_dir: Path) -> None:
-    grid: List[Config] = []
-    for ez, xz, hedge, co in itertools.product([1.5, 2.0, 2.5], [0.0, 0.5], ["model", "dollar"], [False, True]):
-        for mc in (0.0, 0.40):
-            grid.append(Config("innov", ez, xz, mc, hedge, co))
-        grid.append(Config("level", ez, xz, 0.0, hedge, co))
+    grid = build_grid()
+    pairs = [(a, b) for a, b in pairs if a in prices and b in prices]
+    cal = pd.DatetimeIndex(sorted(set().union(*[prices[t].index for t in {x for p in pairs for x in p}])))
+    signals: Dict[Tuple[str, int], List[PairBook]] = {}
 
-    signals = {}
-    for a, b in pairs:
-        if a not in prices or b not in prices:
-            continue
-        common = prices[a].index.intersection(prices[b].index)
-        ca, cb = prices[a]["Close"].loc[common], prices[b]["Close"].loc[common]
-        signals[(a, b, "innov")] = innov_signal(ca, cb)
-        signals[(a, b, "level")] = level_signal(ca, cb)
-    used_pairs = sorted({(a, b) for a, b, _ in signals})
-    print(f"pairs with data: {len(used_pairs)}  configs: {len(grid)}")
+    def books_for(cfg: Config) -> List[PairBook]:
+        key = (cfg.signal, cfg.window if cfg.signal == "level" else 0)
+        if key not in signals:
+            bks = []
+            for a, b in pairs:
+                common = prices[a].index.intersection(prices[b].index)
+                ca, cb = prices[a]["Close"].loc[common], prices[b]["Close"].loc[common]
+                sig = innov_signal(ca, cb) if cfg.signal == "innov" else level_signal(ca, cb, cfg.window)
+                bks.append(PairBook(a, b, prices, sig, cal))
+            signals[key] = bks
+        return signals[key]
 
+    print(f"pairs with data: {len(pairs)}  configs: {len(grid)}  calendar: {cal[0].date()} → {cal[-1].date()}")
     oos = pd.Timestamp(OOS_START)
-    rows, pair_rows = [], []
-    coint_caches: Dict[Tuple[str, str], Dict[int, bool]] = {}
+    rows, pair_rows, yearly_rows = [], [], []
     for cfg in grid:
-        all_daily, all_trades = [], []
-        for a, b in used_pairs:
-            sig = signals[(a, b, cfg.signal)]
-            cache = coint_caches.setdefault((a, b, cfg.signal), {})
-            trades, daily = simulate_pair(f"{a}/{b}", prices[a], prices[b], sig, cfg, cache)
-            all_daily.append(daily)
-            all_trades.extend(trades)
-            if cfg.signal in ("innov", "level"):
-                is_t = [t for t in trades if t.entry_date < oos]
-                oo_t = [t for t in trades if t.entry_date >= oos]
-                pair_rows.append({"config": cfg.name, "pair": f"{a}/{b}",
-                                  "is_pnl": round(sum(t.pnl for t in is_t), 0), "is_trades": len(is_t),
-                                  "oos_pnl": round(sum(t.pnl for t in oo_t), 0), "oos_trades": len(oo_t)})
-        daily = pd.concat(all_daily, axis=1).fillna(0.0).sum(axis=1).sort_index()
-        is_d, oo_d = daily[daily.index < oos], daily[daily.index >= oos]
-        is_m = summarize(is_d, [t for t in all_trades if t.entry_date < oos])
-        oo_m = summarize(oo_d, [t for t in all_trades if t.entry_date >= oos])
+        trades, daily = simulate_portfolio(books_for(cfg), cfg, cal)
+        is_m = summarize(daily[daily.index < oos], [t for t in trades if t.entry_date < oos])
+        oo_m = summarize(daily[daily.index >= oos], [t for t in trades if t.entry_date >= oos])
+        all_m = summarize(daily, trades)
         rows.append({"config": cfg.name, **asdict(cfg),
                      **{f"is_{k}": v for k, v in is_m.items()},
-                     **{f"oos_{k}": v for k, v in oo_m.items()}})
+                     **{f"oos_{k}": v for k, v in oo_m.items()},
+                     **{f"all_{k}": v for k, v in all_m.items()}})
+        by_year = daily.groupby(daily.index.year).sum().round(0)
+        yearly_rows.append({"config": cfg.name, **{str(y): v for y, v in by_year.items()}})
+        for lbl in sorted({t.pair for t in trades}):
+            pt = [t for t in trades if t.pair == lbl]
+            pair_rows.append({"config": cfg.name, "pair": lbl,
+                              "is_pnl": round(sum(t.pnl for t in pt if t.entry_date < oos), 0),
+                              "oos_pnl": round(sum(t.pnl for t in pt if t.entry_date >= oos), 0),
+                              "trades": len(pt)})
 
     res = pd.DataFrame(rows).sort_values("is_sharpe", ascending=False)
+    yearly = pd.DataFrame(yearly_rows).set_index("config")
     out_dir.mkdir(parents=True, exist_ok=True)
     res.to_csv(out_dir / "grid_results.csv", index=False)
+    yearly.to_csv(out_dir / "yearly_pnl.csv")
     pd.DataFrame(pair_rows).to_csv(out_dir / "pair_results.csv", index=False)
 
-    cols = ["config", "is_pnl", "is_sharpe", "is_trades", "is_win_rate",
-            "oos_pnl", "oos_sharpe", "oos_trades", "oos_win_rate", "oos_avg_trade", "oos_max_dd"]
-    live_like = res[res["config"] == Config("innov", 1.5, 0.5, 0.40, "dollar", False).name]
-    with pd.option_context("display.width", 250, "display.max_columns", 30):
-        print("\n=== LIVE-LIKE CONFIG (innov z, entry 1.5, conf 0.40, equal-dollar legs, no coint gate) ===")
-        print(live_like[cols].to_string(index=False))
-        print(f"\n=== TOP 15 BY IN-SAMPLE SHARPE (IS < {OOS_START} <= OOS) ===")
-        print(res[cols].head(15).to_string(index=False))
-        print("\n=== TOP 10 BY OOS SHARPE (for reference only — do NOT select on this) ===")
-        print(res.sort_values("oos_sharpe", ascending=False)[cols].head(10).to_string(index=False))
-        best = res.iloc[0]["config"]
-        pr = pd.DataFrame(pair_rows)
-        pr = pr[pr["config"] == best].sort_values("is_pnl", ascending=False)
-        print(f"\n=== PER-PAIR, best IS config: {best} ===")
-        print(pr.to_string(index=False))
-    summary = {"oos_start": OOS_START, "best_is_config": res.iloc[0].to_dict(),
-               "live_like": live_like.iloc[0].to_dict() if len(live_like) else None}
+    cols = ["config", "is_pnl", "is_sharpe", "is_trades", "oos_pnl", "oos_sharpe", "oos_trades",
+            "oos_win_rate", "oos_avg_trade", "all_pnl", "all_sharpe", "all_max_dd"]
+    level = res[res["signal"] == "level"]
+    with pd.option_context("display.width", 260, "display.max_columns", 40, "display.max_rows", 200):
+        print("\n=== INNOVATION-SIGNAL REFERENCE ROWS (live-like first) ===")
+        print(res[res["signal"] == "innov"][cols].to_string(index=False))
+        print(f"\n=== LEVEL SIGNAL, ALL CONFIGS BY IN-SAMPLE SHARPE (IS < {OOS_START} <= OOS) ===")
+        print(level[cols].to_string(index=False))
+        print("\n=== ROBUSTNESS: fraction of level configs profitable ===")
+        for part in ("is", "oos", "all"):
+            print(f"  {part}: {(level[f'{part}_pnl'] > 0).mean():.0%} of {len(level)} configs")
+        print("\n=== LEVER EFFECTS (median all-period P&L across level configs) ===")
+        for lever in ("window", "entry_z", "exit_z", "exclusive", "delay"):
+            print(f"  {lever}: " + ", ".join(f"{k}→{v:,.0f}" for k, v in
+                                             level.groupby(lever)["all_pnl"].median().items()))
+        top = list(level["config"].head(5)) + [LIVE_LIKE.name]
+        print("\n=== YEARLY P&L: top-5 level by IS Sharpe + live-like ===")
+        print(yearly.loc[top].to_string())
+    summary = {"oos_start": OOS_START, "rows": res.to_dict(orient="records")}
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
 
 
