@@ -1,0 +1,43 @@
+name: Research Backtest
+
+# Offline research only: downloads public prices, simulates, uploads a report.
+# No secrets, no broker access, no writes to results-data.
+on:
+  push:
+    branches: ["claude/**"]
+    paths:
+      - "research/**"
+      - "src/**"
+      - ".github/workflows/research-backtest.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run backtest grid
+        run: python research/backtest_pairs.py --out research_out
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-backtest
+          path: research_out/
+          if-no-files-found: warn
