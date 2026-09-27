@@ -4,7 +4,7 @@ name: Research Backtest
 # No secrets, no broker access, no writes to results-data.
 on:
   push:
-    branches: ["claude/**"]
+    branches: ["main-claude", "claude/**"]
     paths:
       - "research/**"
       - "src/**"
