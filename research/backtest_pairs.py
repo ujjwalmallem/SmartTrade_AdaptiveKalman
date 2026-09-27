@@ -384,16 +384,31 @@ def run(prices: Dict[str, pd.DataFrame], pairs: List[Tuple[str, str]], out_dir: 
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
 
 
+# Economically linked pairs (same product / customers / cost base) — the
+# classic pairs-trading universe, as a contrast to trend-heavy AI mega-caps.
+CLASSIC_PAIRS: List[Tuple[str, str]] = [
+    ("KO", "PEP"), ("XOM", "CVX"), ("V", "MA"), ("HD", "LOW"), ("JPM", "BAC"),
+    ("GS", "MS"), ("UPS", "FDX"), ("UNP", "CSX"), ("PG", "CL"), ("DUK", "SO"),
+    ("LMT", "NOC"), ("T", "VZ"), ("MCD", "YUM"), ("COP", "EOG"), ("WFC", "C"),
+    ("SPGI", "MCO"), ("TGT", "WMT"), ("CAT", "DE"), ("ABT", "MDT"), ("MMC", "AON"),
+]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--synthetic", action="store_true")
+    ap.add_argument("--universe", choices=["live", "classic"], default="live")
     ap.add_argument("--out", default="research_out")
     args = ap.parse_args()
 
-    import paper_trading_ml_exit as live
+    if args.universe == "classic":
+        pairs = list(CLASSIC_PAIRS)
+    else:
+        import paper_trading_ml_exit as live
 
-    specs = live.build_pair_universe(max_pairs_per_basket=6)
-    pairs = [(p.ticker_a, p.ticker_b) for p in specs]
+        specs = live.build_pair_universe(max_pairs_per_basket=6)
+        pairs = [(p.ticker_a, p.ticker_b) for p in specs]
+    print(f"universe: {args.universe} ({len(pairs)} pairs)")
     tickers = sorted({t for pr in pairs for t in pr})
     prices = load_synthetic(tickers) if args.synthetic else load_yfinance(tickers)
     if prices:
