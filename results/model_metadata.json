@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-11-10T18:16:01.133190+00:00",
+  "trained_at": "2026-11-10T18:31:05.641748+00:00",
   "feature_names": [
     "vol",
     "pnl_proxy",
@@ -23,23 +23,23 @@
     "n_train": 2678,
     "n_test": 891,
     "class_balance": {
-      "label_0": 400,
-      "label_1": 3169,
-      "positive_rate": 0.8879237881759596
+      "label_0": 399,
+      "label_1": 3170,
+      "positive_rate": 0.8882039787055197
     },
     "accuracy": 0.8956228956228957,
-    "roc_auc": 0.8232986589798221
+    "roc_auc": 0.822308559969921
   },
   "coefficients": {
-    "vol": 0.4941432116207327,
-    "pnl_proxy": -0.9298259369661691,
-    "abs_entry_z": 0.3426795222979691,
-    "confidence": 0.2819346587578379,
-    "exit_z": -0.16317726328315285,
-    "velocity": 0.22623880659229634,
-    "bars_held": -0.8701741550716999,
-    "half_life": 1.4324237780442572,
-    "bias": 0.8418077665147519
+    "vol": 0.5163537958559822,
+    "pnl_proxy": -0.9286261272982285,
+    "abs_entry_z": 0.334182672477836,
+    "confidence": 0.28854080517651365,
+    "exit_z": -0.16824803362844795,
+    "velocity": 0.23852796197943923,
+    "bars_held": -0.8471207423215974,
+    "half_life": 1.4192547658871026,
+    "bias": 0.8475432076789264
   },
   "model_path": "models/logistic_exit_model.pkl",
   "scaler_path": "models/feature_scaler.pkl"
